@@ -71,7 +71,7 @@ func (c *Client) ensureSecretMount(ctx context.Context, m Mount) (bool, error) {
 		}
 		return true, nil
 	}
-	if existing.PluginVersion == m.Version {
+	if sameVersion(existing.PluginVersion, m.Version) {
 		return false, nil
 	}
 	if err := c.api.Sys().TuneMountAllowNilWithContext(ctx, path, api.TuneMountConfigInput{PluginVersion: &m.Version}); err != nil {
@@ -98,7 +98,7 @@ func (c *Client) ensureAuthMount(ctx context.Context, m Mount) (bool, error) {
 		}
 		return true, nil
 	}
-	if existing.PluginVersion == m.Version {
+	if sameVersion(existing.PluginVersion, m.Version) {
 		return false, nil
 	}
 	// Auth mounts are tuned under the "auth/" prefix.

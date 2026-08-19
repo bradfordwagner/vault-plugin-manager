@@ -15,11 +15,16 @@ import (
 
 // fetchOCI pulls the image, flattens its filesystem, and returns the file at
 // req.Path. Registry auth uses the ambient Docker keychain (config/pull secrets).
-func fetchOCI(ctx context.Context, req Request) ([]byte, error) {
+// When insecure is set, plain-HTTP / untrusted-TLS registries are allowed.
+func fetchOCI(ctx context.Context, req Request, insecure bool) ([]byte, error) {
 	if req.Path == "" {
 		return nil, fmt.Errorf("fetch: oci source requires path")
 	}
-	ref, err := name.ParseReference(req.Image)
+	var refOpts []name.Option
+	if insecure {
+		refOpts = append(refOpts, name.Insecure)
+	}
+	ref, err := name.ParseReference(req.Image, refOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("fetch: parsing image %q: %w", req.Image, err)
 	}

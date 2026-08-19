@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/hashicorp/vault/api"
 )
@@ -33,9 +34,9 @@ func (c *Client) EnsurePlugin(ctx context.Context, p Plugin) (changed bool, err 
 		return false, err
 	}
 	if existing != nil &&
-		existing.SHA256 == p.SHA256 &&
+		strings.EqualFold(existing.SHA256, p.SHA256) &&
 		existing.Command == p.Command &&
-		existing.Version == p.Version {
+		sameVersion(existing.Version, p.Version) {
 		return false, nil // already registered as desired
 	}
 
@@ -92,6 +93,14 @@ func parsePluginType(t string) (api.PluginType, error) {
 		return api.PluginTypeUnknown, fmt.Errorf("vault: unsupported plugin type %q", t)
 	}
 	return pt, nil
+}
+
+// sameVersion compares plugin versions ignoring the leading "v" that Vault adds
+// to registered semver versions (we register "1.0.0"; Vault reports "v1.0.0").
+// Without this, the idempotency checks never match and the manager re-registers
+// and reloads the plugin on every reconcile.
+func sameVersion(a, b string) bool {
+	return strings.TrimPrefix(a, "v") == strings.TrimPrefix(b, "v")
 }
 
 // isNotFound reports whether err is a Vault 404 response.

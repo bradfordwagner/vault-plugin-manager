@@ -30,6 +30,7 @@ func init() {
 	flag_helper.CreateFlag(fs, &serveArgs.VaultNamespace, "vault_namespace", "", "", "Namespace Vault runs in; defaults to own namespace (env VAULT_NAMESPACE)")
 	flag_helper.CreateFlag(fs, &serveArgs.VaultContainer, "vault_container", "", "vault", "Vault container name to exec into (env VAULT_CONTAINER)")
 	flag_helper.CreateFlag(fs, &serveArgs.PluginDir, "plugin_dir", "", "/vault/plugins", "Vault plugin_directory path (env PLUGIN_DIR)")
+	flag_helper.CreateFlag(fs, &serveArgs.OCIInsecure, "oci_insecure", "", false, "Allow OCI pulls from plain-HTTP/untrusted-TLS registries (env OCI_INSECURE)")
 
 	// NOTE: runtime tunables (pruneMode, resyncInterval, logLevel) are sourced
 	// from the watched ConfigMap's `settings` block, not from flags/env.

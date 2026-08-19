@@ -101,14 +101,15 @@ The manager authenticates via the Vault **Kubernetes auth method**. Its role mus
 map to a policy with these capabilities:
 
 ```hcl
-# Register / deregister / read plugins in the catalog
+# Register / deregister / read plugins in the catalog.
+# The plugin catalog is a root-protected path, so it requires "sudo".
 path "sys/plugins/catalog/*" {
-  capabilities = ["create", "read", "update", "delete", "list"]
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
 }
 
 # Reload a plugin backend after (re)registration
 path "sys/plugins/reload/backend" {
-  capabilities = ["create", "update"]
+  capabilities = ["create", "update", "sudo"]
 }
 
 # Enable / tune / disable secret engine mounts

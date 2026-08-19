@@ -143,14 +143,14 @@ subcommand is a nice-to-have for CI/debugging.
 The manager's Vault role maps to a policy granting:
 
 ```hcl
-# Register / deregister / read plugins in the catalog
+# Register / deregister / read plugins in the catalog (root-protected -> sudo)
 path "sys/plugins/catalog/*" {
-  capabilities = ["create", "read", "update", "delete", "list"]
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
 }
 
 # Reload a plugin backend after (re)registration
 path "sys/plugins/reload/backend" {
-  capabilities = ["create", "update"]
+  capabilities = ["create", "update", "sudo"]
 }
 
 # Enable / tune / disable secret engine mounts

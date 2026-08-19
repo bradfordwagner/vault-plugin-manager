@@ -205,8 +205,12 @@ func (r *Reconciler) prune(ctx context.Context, mode config.PruneMode, pods []st
 // metadata Vault needs, e.g. "vault-plugin-secrets-foo-0.3.1".
 func pluginFileName(name, version string) string { return name + "-" + version }
 
-func nvKey(name, version string) string { return name + "@" + version }
-func mountKey(p, mtype string) string   { return mtype + ":" + strings.Trim(p, "/") }
+// nvKey identifies a plugin version. The version is normalized (leading "v"
+// trimmed) so our "1.0.0" and Vault's reported "v1.0.0" compare equal.
+func nvKey(name, version string) string {
+	return name + "@" + strings.TrimPrefix(version, "v")
+}
+func mountKey(p, mtype string) string { return mtype + ":" + strings.Trim(p, "/") }
 
 func toRequest(c config.CatalogEntry) fetch.Request {
 	return fetch.Request{

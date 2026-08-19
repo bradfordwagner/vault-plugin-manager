@@ -55,7 +55,7 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 	l.Info("kubernetes client initialized")
 
 	// Reconciler + runner: watch the ConfigMap and drive Vault toward it.
-	rec := reconcile.New(vc, kc, fetch.NewClient(), reconcile.Config{
+	rec := reconcile.New(vc, kc, fetch.NewClient(fetch.WithInsecureOCI(a.OCIInsecure)), reconcile.Config{
 		VaultNamespace:   a.VaultNamespace,
 		VaultPodSelector: a.VaultPodSelector,
 		VaultContainer:   a.VaultContainer,

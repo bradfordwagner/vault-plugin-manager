@@ -54,6 +54,8 @@ spec:
               value: {{ .Values.vault.container | quote }}
             - name: PLUGIN_DIR
               value: {{ .Values.vault.pluginDir | quote }}
+            - name: OCI_INSECURE
+              value: {{ .Values.ociInsecure | quote }}
             - name: CONFIGMAP_NAME
               value: {{ .Values.configMap.name | quote }}
             - name: CONFIGMAP_NAMESPACE
@@ -70,6 +72,14 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          volumeMounts:
+            # Writable scratch dir; the root filesystem is read-only and the OCI
+            # fetcher may buffer image layers under TMPDIR.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

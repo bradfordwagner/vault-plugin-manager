@@ -23,6 +23,10 @@ type ServeArgs struct {
 	VaultNamespace   string `mapstructure:"VAULT_NAMESPACE"`    // namespace Vault runs in
 	VaultContainer   string `mapstructure:"VAULT_CONTAINER"`    // container name to exec into
 	PluginDir        string `mapstructure:"PLUGIN_DIR"`         // Vault plugin_directory path
+
+	// OCIInsecure allows pulling plugin binaries from OCI registries served over
+	// plain HTTP / untrusted TLS (e.g. an in-cluster registry). Off by default.
+	OCIInsecure bool `mapstructure:"OCI_INSECURE"`
 }
 
 // Runtime tunables (prune mode, resync interval, log level) are NOT here on

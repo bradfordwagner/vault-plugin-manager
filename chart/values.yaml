@@ -17,6 +17,10 @@ vault:
   container: vault
   pluginDir: /vault/plugins
 
+# OCI pulls: allow plain-HTTP / untrusted-TLS registries (e.g. an in-cluster
+# registry used for testing). Leave false in production.
+ociInsecure: false
+
 configMap:
   # Name of the ConfigMap the manager watches. Empty namespace = release namespace.
   name: vault-plugins

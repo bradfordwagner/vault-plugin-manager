@@ -32,10 +32,28 @@ type Fetcher interface {
 }
 
 // Client is the default Fetcher supporting HTTPS and OCI sources.
-type Client struct{}
+type Client struct {
+	insecureOCI bool
+}
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithInsecureOCI allows pulling OCI images from registries served over plain
+// HTTP or with untrusted TLS (e.g. an in-cluster registry). Leave off in
+// production unless a trusted private registry requires it.
+func WithInsecureOCI(v bool) Option {
+	return func(c *Client) { c.insecureOCI = v }
+}
 
 // NewClient returns the default fetcher.
-func NewClient() *Client { return &Client{} }
+func NewClient(opts ...Option) *Client {
+	c := &Client{}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
 
 // Fetch retrieves and extracts the binary, computes its sha256, and verifies it
 // against req.SHA256 when that is provided (failing closed on mismatch).
@@ -50,7 +68,7 @@ func (c *Client) Fetch(ctx context.Context, req Request) (*Result, error) {
 	case req.URL != "":
 		bin, err = fetchHTTP(ctx, req)
 	case req.Image != "":
-		bin, err = fetchOCI(ctx, req)
+		bin, err = fetchOCI(ctx, req, c.insecureOCI)
 	default:
 		return nil, fmt.Errorf("fetch: request has neither url nor image")
 	}

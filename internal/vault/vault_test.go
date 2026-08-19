@@ -45,6 +45,23 @@ func TestWithManagedAndIsManaged(t *testing.T) {
 	}
 }
 
+func TestSameVersion(t *testing.T) {
+	equal := [][2]string{
+		{"1.0.0", "v1.0.0"},
+		{"v1.0.0", "1.0.0"},
+		{"1.0.0", "1.0.0"},
+		{"v2.3.4", "v2.3.4"},
+	}
+	for _, p := range equal {
+		if !sameVersion(p[0], p[1]) {
+			t.Errorf("sameVersion(%q,%q) = false, want true", p[0], p[1])
+		}
+	}
+	if sameVersion("1.0.0", "1.0.1") {
+		t.Errorf("sameVersion(1.0.0,1.0.1) = true, want false")
+	}
+}
+
 func TestNormPath(t *testing.T) {
 	for in, want := range map[string]string{
 		"foo":   "foo",
