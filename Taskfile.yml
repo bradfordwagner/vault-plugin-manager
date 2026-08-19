@@ -6,6 +6,5 @@ tasks:
   default:
     cmds:
       - clear
-      - goreleaser build --snapshot --clean
-      - tree dist
+      - go build ./...
     silent: true
