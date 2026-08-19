@@ -23,15 +23,25 @@ ConfigMap with an informer plus a settings-driven resync.
 
 ```sh
 go build ./...        # build
-go test ./...         # unit tests (no cluster needed; fakes + httptest)
+go test ./...         # unit tests (no cluster; fakes + httptest)
 go vet ./...
 gofmt -w internal/    # format (also: make test)
 helm lint ./chart
 helm template x ./chart --namespace vault   # render manifests
+
+# end-to-end: real Vault on a kind cluster (needs docker, kind, kubectl, helm)
+test/e2e/run.sh 1.20.4         # any hashicorp/vault tag; KEEP=1 leaves the cluster up
+
+# container image (root Dockerfile; scratch/alpine variants)
+docker build --build-arg BASE_IMAGE=scratch     -t vpm:scratch .
+docker build --build-arg BASE_IMAGE=alpine:3.22 -t vpm:alpine  .
 ```
 
-`make test`, `make watch` (watchexec dev loop), and `make clean` also exist.
+Or via [Task](https://taskfile.dev): `task` (build), `task check` (build+vet+test),
+`task test`, `task lint`, `task e2e -- 1.20.4`, `task image -- alpine:3.22`;
+`task --list` shows all. `make test`/`make watch`/`make clean` also exist.
 The binary entrypoint is `./cmd/vault-plugin-manager` (subcommand: `serve`).
+Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
 
 ## Architecture (package layout)
 
@@ -49,6 +59,11 @@ The binary entrypoint is `./cmd/vault-plugin-manager` (subcommand: `serve`).
   and the informer/timer `Runner` (`runner.go`).
 - `internal/logging/` — shared zap logger with a runtime-settable atomic level.
 - `chart/` — Helm chart (deployment, serviceaccount, RBAC, optional ConfigMap).
+- `Dockerfile` (root) — multi-stage: builds with the owned Go builder, slices the
+  static binary into a `scratch` or `alpine` image.
+- `test/e2e/` — end-to-end harness (kind + real Vault matrix). `testplugin/` is a
+  **separate Go module** (a real minimal Vault secrets engine) so the Vault SDK
+  stays out of the manager's dependency graph.
 
 ## Conventions
 
@@ -67,6 +82,12 @@ The binary entrypoint is `./cmd/vault-plugin-manager` (subcommand: `serve`).
 - **Reconciler is testable.** It depends on narrow `VaultOps` / `PodOps`
   interfaces (satisfied by the real clients) and the `fetch.Fetcher` interface,
   so `reconcile_test.go` drives it with fakes — no cluster or Vault required.
+- **Vault version strings carry a leading `v`.** Register `1.0.0` and Vault
+  reports it back as `v1.0.0` (on catalog reads and mount `plugin_version`).
+  Always compare versions with the `v` trimmed — `vault.sameVersion`,
+  `reconcile.nvKey`. Skipping this makes every idempotency check miss, so the
+  manager re-registers + **reloads every plugin on every reconcile** (churn that
+  makes mounts flap). This bug was caught by the e2e; keep it fixed.
 
 ## Key design decisions (don't relitigate without reason)
 
@@ -86,9 +107,31 @@ The binary entrypoint is `./cmd/vault-plugin-manager` (subcommand: `serve`).
 - **Token strategy:** lifetime-watcher renew, re-login when non-renewable / on
   failure.
 - **Reload uses global scope** so standby HA nodes pick up the new binary.
+- **Vault ACL needs `sudo`.** `sys/plugins/catalog/*` and `sys/plugins/reload/backend`
+  are root-protected — the manager's policy must include `sudo` (see README ACL).
+- **OCI insecure registries.** `OCI_INSECURE` (flag/env) / chart `ociInsecure`
+  lets the OCI fetcher pull from plain-HTTP / untrusted-TLS registries (e.g. the
+  in-cluster registry the e2e uses). Off by default.
+
+## Build & release
+
+- **Images**: root `Dockerfile`, built with the owned Go builder
+  (`ghcr.io/bradfordwagner/go-builder:1.26-ubuntu_noble`, `GOTOOLCHAIN=auto` so the
+  builder's Go minor need not match go.mod) and sliced into a `scratch` or
+  `alpine-3.x` final image (CI matrix). Runs as numeric non-root `65532:65532`,
+  `ENTRYPOINT=[binary]`, `CMD=[serve]`, with a bundled CA cert for TLS. No CNB /
+  goreleaser (removed).
+- **Workflows**: `docker_branches.yml` builds both variants on branch pushes;
+  `docker_tags.yml` builds + pushes them on tag; `helm_tags.yml` publishes the
+  chart as an OCI artifact on tag. Both tag workflows fire on `push: tags`, so
+  **image and chart release together**. `e2e.yml` runs the Vault-version matrix
+  (latest patch of the three most-recent community minor lines) on PRs.
+- The e2e uses its own self-contained `test/e2e/Dockerfile.manager`
+  (golang + distroless), so local e2e runs don't need the private builder.
 
 ## Known limitations
 
 See `SPEC.md` §10: database-plugin mount handling isn't wired; catalog entries
 registered without a mount aren't auto-pruned (no ownership marker on the
-catalog). Nothing here has been integration-tested against a live cluster yet.
+catalog). The reconcile chain **is** validated end-to-end against real Vault by
+`test/e2e/` (register → mount → write/read → prune, across the version matrix).

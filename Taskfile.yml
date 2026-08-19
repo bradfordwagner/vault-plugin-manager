@@ -1,10 +1,51 @@
 # https://taskfile.dev
+#
+# Run `task --list` to see targets. `task` (no args) builds.
 
 version: '3'
 
 tasks:
   default:
+    desc: Build all packages
+    deps: [build]
+
+  build:
+    desc: Compile all packages
     cmds:
-      - clear
       - go build ./...
-    silent: true
+
+  test:
+    desc: Run unit tests (no cluster needed; fakes + httptest)
+    cmds:
+      - go test ./...
+
+  vet:
+    desc: go vet
+    cmds:
+      - go vet ./...
+
+  fmt:
+    desc: Format Go sources
+    cmds:
+      - gofmt -w .
+
+  lint:
+    desc: Lint the Helm chart
+    cmds:
+      - helm lint ./chart
+
+  check:
+    desc: Build, vet, and unit-test
+    deps: [build, vet, test]
+
+  e2e:
+    desc: 'End-to-end test on kind against real Vault. Usage: task e2e -- 1.20.4'
+    cmds:
+      - test/e2e/run.sh {{.CLI_ARGS}}
+
+  image:
+    desc: 'Build the container image. Usage: task image -- scratch | task image -- alpine:3.22'
+    vars:
+      BASE: '{{.CLI_ARGS | default "scratch"}}'
+    cmds:
+      - docker build --build-arg BASE_IMAGE={{.BASE}} -t vault-plugin-manager:local .
