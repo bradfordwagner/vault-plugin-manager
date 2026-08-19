@@ -18,6 +18,65 @@
    secret works through each. Then removes the OCI entry and asserts prune
    disabled the mount + deregistered the version while the HTTPS mount survived.
 
+## How it fits together
+
+Components (all in namespace `e2e`) and who talks to whom. `run.sh` sets the
+stage from the host; the **manager** then does the real work on its own.
+
+```mermaid
+flowchart TB
+  RUN["run.sh (orchestrator, on host/CI)"]
+
+  subgraph cluster["kind cluster — namespace e2e"]
+    CM["ConfigMap: vault-plugins<br/>settings + catalog + mounts"]
+    MGR["vault-plugin-manager<br/>(installed via Helm chart)"]
+    VAULT["Vault dev server<br/>plugin_directory = /vault/plugins"]
+    REG["registry:2<br/>OCI plugin source"]
+    HTTP["plugin-http<br/>busybox httpd — HTTPS plugin source"]
+  end
+
+  RUN -->|crane push plugin image| REG
+  RUN -->|exec: enable k8s auth, write policy + role| VAULT
+  RUN -->|apply ConfigMap| CM
+  RUN -->|assert: register / mount / write+read / prune| VAULT
+
+  MGR -->|watch| CM
+  MGR -->|Kubernetes auth login| VAULT
+  MGR -->|fetch binary over HTTP| HTTP
+  MGR -->|fetch binary over OCI insecure| REG
+  MGR -->|exec-copy binary into plugin_directory| VAULT
+  MGR -->|register catalog / enable mount / reload| VAULT
+```
+
+Ordered flow of one run:
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant R as run.sh
+  participant V as Vault
+  participant M as manager
+  participant S as plugin sources (http + registry)
+
+  R->>V: deploy dev Vault, registry, http server
+  R->>S: push plugin image (crane, via port-forward)
+  R->>V: enable k8s auth, write policy + role
+  R->>R: apply ConfigMap (HTTPS + OCI plugins)
+  R->>M: helm install manager
+  M->>V: k8s auth login
+  M->>S: fetch plugin binary, verify sha256
+  M->>V: exec-copy binary into plugin_directory
+  M->>V: register catalog + enable mount + reload
+  R->>V: assert registered + mounted + write/read (both)
+  R->>R: rewrite ConfigMap (drop OCI plugin)
+  M->>V: prune OCI mount + deregister version
+  R->>V: assert OCI gone, HTTPS retained
+```
+
+The same image backs both plugin sources: `testplugin/Dockerfile` bakes the
+binary at `/www/foo` (served by httpd) **and** `/plugin/foo` (read out of the
+image rootfs by the OCI fetcher), so one sha256 covers both.
+
 ## Run it locally
 
 Requires `docker`, `kind`, `kubectl`, `helm`.
