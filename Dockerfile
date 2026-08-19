@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build with the owned Go builder (override BUILDER_IMAGE in CI to pin a tag).
-ARG BUILDER_IMAGE=ghcr.io/bradfordwagner/go-builder:latest
+ARG BUILDER_IMAGE=ghcr.io/bradfordwagner/go-builder:1.26-ubuntu_noble
 # Final base image. The CI matrix sets this to "scratch" or "alpine:3.xx".
 ARG BASE_IMAGE=scratch
 

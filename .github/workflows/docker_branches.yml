@@ -9,7 +9,7 @@ on:
 env:
   image: ghcr.io/bradfordwagner/vault-plugin-manager
   # The owned Go builder used for the build stage. Pin to a real tag.
-  builder_image: ghcr.io/bradfordwagner/go-builder:latest
+  builder_image: ghcr.io/bradfordwagner/go-builder:1.26-ubuntu_noble
 jobs:
   build:
     runs-on: ubuntu-latest
