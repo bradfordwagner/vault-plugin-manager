@@ -20,6 +20,8 @@ jobs:
           - "1.17.6"
           - "1.18.5"
           - "1.19.0"
+          - "1.20.4"
+          - "2.0.4"
     name: "vault ${{ matrix.vault }}"
     steps:
       - uses: actions/checkout@v4
