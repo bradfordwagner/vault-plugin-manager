@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vault-plugin-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vault-plugin-manager.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vault-plugin-manager.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vault-plugin-manager.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "vault-plugin-manager.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: manager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "%s-scratch" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          env:
+            - name: VAULT_ADDR
+              value: {{ .Values.vault.addr | quote }}
+            - name: VAULT_AUTH_MOUNT
+              value: {{ .Values.vault.authMount | quote }}
+            - name: VAULT_AUTH_ROLE
+              value: {{ .Values.vault.authRole | quote }}
+            - name: VAULT_CA_CERT
+              value: {{ .Values.vault.caCert | quote }}
+            - name: VAULT_SKIP_VERIFY
+              value: {{ .Values.vault.skipVerify | quote }}
+            - name: VAULT_POD_SELECTOR
+              value: {{ .Values.vault.podSelector | quote }}
+            - name: VAULT_NAMESPACE
+              value: {{ .Values.vault.namespace | default .Release.Namespace | quote }}
+            - name: VAULT_CONTAINER
+              value: {{ .Values.vault.container | quote }}
+            - name: PLUGIN_DIR
+              value: {{ .Values.vault.pluginDir | quote }}
+            - name: OCI_INSECURE
+              value: {{ .Values.ociInsecure | quote }}
+            - name: CONFIGMAP_NAME
+              value: {{ .Values.configMap.name | quote }}
+            - name: CONFIGMAP_NAMESPACE
+              value: {{ include "vault-plugin-manager.configMapNamespace" . | quote }}
+            - name: CONFIGMAP_KEY
+              value: {{ .Values.configMap.key | quote }}
+            # pruneMode, resyncInterval, and logLevel are NOT set here — they are
+            # read from the watched ConfigMap's `settings` block at runtime.
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # Writable scratch dir; the root filesystem is read-only and the OCI
+            # fetcher may buffer image layers under TMPDIR.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

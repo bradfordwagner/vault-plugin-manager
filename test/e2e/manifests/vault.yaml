@@ -1,0 +1,83 @@
+# Vault dev server for e2e. Dev mode is unsealed with a known root token and
+# uses -dev-plugin-dir as its plugin_directory. The shared emptyDir is made
+# group-writable via fsGroup so the manager's exec-copy (running as the vault
+# container user) can write plugin binaries into it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault
+  namespace: e2e
+---
+# Vault needs to create TokenReviews to validate the manager's Kubernetes-auth login.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-e2e-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault
+    namespace: e2e
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vault
+  namespace: e2e
+  labels:
+    app: vault
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vault
+  template:
+    metadata:
+      labels:
+        app: vault
+    spec:
+      serviceAccountName: vault
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: vault
+          image: __VAULT_IMAGE__
+          args:
+            - server
+            - -dev
+            - -dev-plugin-dir=/vault/plugins
+            - -dev-listen-address=0.0.0.0:8200
+          env:
+            - name: VAULT_DEV_ROOT_TOKEN_ID
+              value: root
+            - name: VAULT_ADDR
+              value: http://127.0.0.1:8200
+          ports:
+            - containerPort: 8200
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: 8200
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          volumeMounts:
+            - name: plugins
+              mountPath: /vault/plugins
+      volumes:
+        - name: plugins
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: e2e
+spec:
+  selector:
+    app: vault
+  ports:
+    - port: 8200
+      targetPort: 8200

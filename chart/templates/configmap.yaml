@@ -1,0 +1,12 @@
+{{- if .Values.configMap.create -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.configMap.name }}
+  namespace: {{ include "vault-plugin-manager.configMapNamespace" . }}
+  labels:
+    {{- include "vault-plugin-manager.labels" . | nindent 4 }}
+data:
+  {{ .Values.configMap.key }}: |
+    {{- toYaml .Values.configMap.spec | nindent 4 }}
+{{- end }}

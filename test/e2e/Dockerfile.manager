@@ -1,0 +1,15 @@
+# Builds the vault-plugin-manager image for e2e (kind-loaded, chart-installed).
+# Context is the repo root: docker build -f test/e2e/Dockerfile.manager .
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/vault-plugin-manager ./cmd/vault-plugin-manager
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=build /out/vault-plugin-manager /vault-plugin-manager
+# Numeric uid so Kubernetes' runAsNonRoot check can verify it (the :nonroot tag's
+# named user "nonroot" is uid 65532 but non-numeric users fail that check).
+USER 65532:65532
+ENTRYPOINT ["/vault-plugin-manager"]

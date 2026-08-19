@@ -1,0 +1,16 @@
+vault-plugin-manager is installed as {{ include "vault-plugin-manager.fullname" . }}
+in namespace {{ .Release.Namespace }}.
+
+It watches ConfigMap {{ .Values.configMap.name }} (key {{ .Values.configMap.key }})
+in namespace {{ include "vault-plugin-manager.configMapNamespace" . }} and reconciles
+Vault at {{ .Values.vault.addr }} using Kubernetes auth role "{{ .Values.vault.authRole }}".
+
+Before it can work, ensure on the Vault side:
+  1. A Kubernetes auth role "{{ .Values.vault.authRole }}" bound to ServiceAccount
+     "{{ include "vault-plugin-manager.serviceAccountName" . }}" in namespace {{ .Release.Namespace }}.
+  2. That role is attached to a policy granting the capabilities documented in the
+     project README (§ Vault ACL policy).
+  3. Vault started with plugin_directory = {{ .Values.vault.pluginDir }}.
+
+Check status:
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "vault-plugin-manager.fullname" . }}
