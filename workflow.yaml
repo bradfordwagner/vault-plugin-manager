@@ -1,0 +1,51 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: go-cli-template-
+spec:
+  podGC:
+    strategy: OnPodSuccess # delete pods when workflow is successful
+  entrypoint: main
+  arguments:
+    parameters:
+    - name: git_ref_type
+      value: branches
+    - name: git_version
+  templates:
+  - name: main
+    inputs:
+      parameters:
+      - name: git_ref_type
+      - name: git_version
+      - name: upstream_repo
+        value: quay.io/bradfordwagner/go-builder
+      - name: upstream_tag
+        value: 2.6.0
+    dag:
+      tasks:
+      - name: go-builder
+        arguments:
+          parameters:
+          - name: git_repo
+            value: https://github.com/bradfordwagner/gh-template-go-cli.git
+          - name: git_version
+            value: "{{ inputs.parameters.git_version }}"
+          - name: upstream_repo
+            value: "{{ inputs.parameters.upstream_repo }}"
+          - name: upstream_tag
+            value: "{{ inputs.parameters.upstream_tag }}"
+          - name: platform
+            value: "{{ item.platform }}"
+          - name: vault_secrets_enabled
+            value: true
+          - name: vault_role
+            value: go_releaser_reader
+          - name: vault_env_secrets_paths
+            value: |
+              ["secret/go_releaser"]
+        templateRef:
+          name: flavor-go-template
+          template: "{{inputs.parameters.git_ref_type}}"
+        withItems:
+        - { platform: alpine_3.16 }
+

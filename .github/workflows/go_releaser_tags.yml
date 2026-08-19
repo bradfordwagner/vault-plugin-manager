@@ -1,0 +1,37 @@
+name: go_releaser_tags
+on:
+  push:
+    tags:
+      - '*'
+jobs:
+  go-releaser-tags:
+    permissions: write-all
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout=self
+        uses: actions/checkout@v4
+      - name: task=latest
+        run: |
+          sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d
+          export PATH=$(pwd)/bin:$PATH
+      - name: task=version
+        run: ./bin/task --version
+      - name: checkout=taskfiles@main
+        uses: actions/checkout@v4
+        with:
+          path: taskfiles
+          repository: bradfordwagner/taskfiles
+          ref: main
+      - name: go=1.21
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.21
+      - name: goreleaser=1.24.0
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          version: 1.24.0
+          install-only: true
+      - name: task=tags
+        run: git status && ./bin/task -t ./taskfiles/tasks/go_releaser.yml is_tag=true
+        env:
+          GITHUB_TOKEN: ${{ github.token }} 
