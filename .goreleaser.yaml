@@ -5,8 +5,8 @@ before:
 
 builds:
   - id: cli
-    main: ./cmd/testcli
-    binary: testcli
+    main: ./cmd/vault-plugin-manager
+    binary: vault-plugin-manager
     env:
       - CGO_ENABLED=0
     goos:

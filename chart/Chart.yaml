@@ -1,0 +1,12 @@
+apiVersion: v2
+name: vault-plugin-manager
+description: Reconciles HashiCorp Vault plugins from a Kubernetes ConfigMap
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - vault
+  - plugins
+  - kubernetes
+maintainers:
+  - name: Bradford Wagner

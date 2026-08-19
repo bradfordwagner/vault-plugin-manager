@@ -1,0 +1,43 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "vault-plugin-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vault-plugin-manager.labels" . | nindent 4 }}
+rules:
+  # Watch the plugin spec ConfigMap.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  # Discover Vault pods for exec-copy.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Stream plugin binaries into the Vault container filesystem.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "vault-plugin-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vault-plugin-manager.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "vault-plugin-manager.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "vault-plugin-manager.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- /*
+  NOTE: this Role is namespaced to the release namespace. If the watched
+  ConfigMap (configMap.namespace) or the Vault pods (vault.namespace) live in a
+  different namespace, add matching Role/RoleBindings there.
+*/ -}}

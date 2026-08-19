@@ -1,0 +1,74 @@
+image:
+  repository: ghcr.io/bradfordwagner/vault-plugin-manager
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Manager settings. These map 1:1 to the server's env vars / flags.
+vault:
+  addr: "https://vault.vault.svc:8200"
+  authMount: kubernetes
+  authRole: vault-plugin-manager
+  caCert: ""          # path to a mounted CA cert (optional)
+  skipVerify: false
+  # Vault pod discovery for exec-copy. Empty namespace = release namespace.
+  podSelector: "app.kubernetes.io/name=vault"
+  namespace: ""
+  container: vault
+  pluginDir: /vault/plugins
+
+configMap:
+  # Name of the ConfigMap the manager watches. Empty namespace = release namespace.
+  name: vault-plugins
+  namespace: ""
+  key: plugins.yaml
+  # When true, the chart renders the ConfigMap below from `spec`. When false,
+  # the ConfigMap is expected to exist already (managed out-of-band).
+  create: true
+  # This is the document the manager watches. Edit it (or `kubectl edit` the live
+  # ConfigMap) to change behavior at runtime — no redeploy needed.
+  spec:
+    # Runtime tunables, re-read on every reconcile.
+    settings:
+      # pruneMode: what to do when an owned mount/version leaves this ConfigMap.
+      #   full        - fully authoritative: disable the mount, deregister the
+      #                 version from the catalog, AND delete the binary from every
+      #                 Vault pod. Use when this ConfigMap is the source of truth.
+      #   deregister  - disable the mount + deregister the version, but LEAVE the
+      #                 binary on disk (faster rollback; re-adding skips re-copy).
+      #   never       - add/update only; removals are ignored, cleanup is manual.
+      pruneMode: full
+      # resyncInterval: how often to run a full drift reconcile (Go duration).
+      resyncInterval: 5m
+      # logLevel: debug | info | warn | error
+      logLevel: info
+    catalog: []
+    mounts: []
+
+# The manager needs get/list on pods and create on pods/exec, plus watch on the
+# ConfigMap. Set to false to supply your own RBAC.
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""            # defaults to the fullname
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podSecurityContext: {}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
