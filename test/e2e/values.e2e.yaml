@@ -1,0 +1,26 @@
+# Helm values for the e2e run. The plugins ConfigMap is created out-of-band by
+# run.sh (it needs the computed sha256), so configMap.create is false here.
+image:
+  repository: vault-plugin-manager
+  tag: e2e
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: vault-plugin-manager
+
+vault:
+  addr: http://vault:8200
+  authMount: kubernetes
+  authRole: vault-plugin-manager
+  podSelector: app=vault
+  container: vault
+  pluginDir: /vault/plugins
+
+# Pull the test plugin image from the in-cluster registry over plain HTTP.
+ociInsecure: true
+
+configMap:
+  create: false
+  name: vault-plugins
+  key: plugins.yaml

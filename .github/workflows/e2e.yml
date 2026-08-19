@@ -1,0 +1,46 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        vault:
+          - "1.16.3"
+          - "1.17.6"
+          - "1.18.5"
+          - "1.19.0"
+    name: "vault ${{ matrix.vault }}"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Run e2e
+        run: test/e2e/run.sh
+        env:
+          VAULT_VERSION: ${{ matrix.vault }}
+          KIND_CLUSTER: vpm-e2e-${{ matrix.vault }}

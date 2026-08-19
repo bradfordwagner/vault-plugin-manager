@@ -1,0 +1,6 @@
+.git
+.github
+dist
+mocks
+.claude
+test/e2e/testplugin

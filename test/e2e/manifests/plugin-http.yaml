@@ -1,0 +1,38 @@
+# Serves the test plugin binary over HTTP (busybox httpd at /www/foo) so the
+# manager can fetch it via source.url. Same image also carries /plugin/foo for
+# the OCI path. The image is kind-loaded, so pull policy is IfNotPresent.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plugin-http
+  namespace: e2e
+  labels:
+    app: plugin-http
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: plugin-http
+  template:
+    metadata:
+      labels:
+        app: plugin-http
+    spec:
+      containers:
+        - name: httpd
+          image: __PLUGIN_IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: plugin-http
+  namespace: e2e
+spec:
+  selector:
+    app: plugin-http
+  ports:
+    - port: 8080
+      targetPort: 8080
