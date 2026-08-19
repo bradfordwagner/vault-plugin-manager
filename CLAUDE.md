@@ -25,7 +25,7 @@ ConfigMap with an informer plus a settings-driven resync.
 go build ./...        # build
 go test ./...         # unit tests (no cluster; fakes + httptest)
 go vet ./...
-gofmt -w internal/    # format (also: make test)
+gofmt -w .            # format (or: task fmt)
 helm lint ./chart
 helm template x ./chart --namespace vault   # render manifests
 
@@ -37,9 +37,9 @@ docker build --build-arg BASE_IMAGE=scratch     -t vpm:scratch .
 docker build --build-arg BASE_IMAGE=alpine:3.22 -t vpm:alpine  .
 ```
 
-Or via [Task](https://taskfile.dev): `task` (build), `task check` (build+vet+test),
-`task test`, `task lint`, `task e2e -- 1.20.4`, `task image -- alpine:3.22`;
-`task --list` shows all. `make test`/`make watch`/`make clean` also exist.
+Task runner is [Task](https://taskfile.dev) (no Makefile): `task` (build),
+`task check` (build+vet+test), `task test`, `task lint`, `task watch` (watchexec
+dev loop), `task e2e -- 1.20.4`, `task image -- alpine:3.22`; `task --list` shows all.
 The binary entrypoint is `./cmd/vault-plugin-manager` (subcommand: `serve`).
 Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
 

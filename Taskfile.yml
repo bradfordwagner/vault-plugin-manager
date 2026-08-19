@@ -38,6 +38,11 @@ tasks:
     desc: Build, vet, and unit-test
     deps: [build, vet, test]
 
+  watch:
+    desc: Re-run unit tests on Go file changes (needs watchexec)
+    cmds:
+      - watchexec -cr -e go -- task test
+
   e2e:
     desc: 'End-to-end test on kind against real Vault. Usage: task e2e -- 1.20.4'
     cmds:
