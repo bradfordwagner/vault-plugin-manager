@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/bradfordwagner/vault-plugin-manager
-  tag: ""            # defaults to .Chart.AppVersion
+  tag: ""            # defaults to <appVersion>-scratch (see image variants: -scratch, -alpine-3.xx)
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
