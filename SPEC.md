@@ -161,16 +161,27 @@ path "sys/mounts/*" {
   capabilities = ["create", "read", "update", "delete"]
 }
 
-# Enable / tune / disable auth method mounts (for auth-type plugins)
+# Read/list auth-method mounts. REQUIRED even with ZERO managed auth mounts: the
+# reconcile's prune pass (`ListManagedMounts`) lists both secret AND auth mounts
+# every loop.
 path "sys/auth" {
   capabilities = ["read"]
 }
+# Auth-method mount management — only needed for auth-type plugins.
 path "sys/auth/*" {
   capabilities = ["create", "read", "update", "delete", "sudo"]
 }
 ```
 
-(Exact paths validated during implementation; `sys/auth/*` typically needs `sudo`.)
+Exact paths validated during implementation. Two non-obvious facts, both from Vault
+ACL being **exact-match** (no implicit prefix nesting):
+
+- `sys/auth` **read** is mandatory even for a secrets-only manager — `ListManagedMounts`
+  calls `ListAuth` unconditionally every reconcile for the prune/drift pass.
+- Narrowing `sys/mounts/*` to per-mount paths for least privilege must grant the
+  `.../tune` subpath too (`sys/mounts/<name>` + `sys/mounts/<name>/tune`), because
+  `TuneMount` on a `plugin_version` bump / config drift hits `.../tune`, which the
+  bare mount path does not cover. See README "Least-privilege variant".
 
 ---
 

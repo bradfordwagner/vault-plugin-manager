@@ -112,7 +112,9 @@ path "sys/plugins/reload/backend" {
   capabilities = ["create", "update", "sudo"]
 }
 
-# Enable / tune / disable secret engine mounts
+# Enable / tune / disable secret engine mounts. The wildcard covers the mount path
+# AND its `.../tune` subpath (see least-privilege note below — Vault ACL paths are
+# exact-match, so a narrower policy must grant `.../tune` explicitly).
 path "sys/mounts" {
   capabilities = ["read"]
 }
@@ -120,10 +122,16 @@ path "sys/mounts/*" {
   capabilities = ["create", "read", "update", "delete"]
 }
 
-# Enable / tune / disable auth method mounts (for auth-type plugins)
+# Read/list auth-method mounts. REQUIRED even when the manager manages ZERO auth
+# mounts: every reconcile enumerates ALL mounts (secret AND auth) for the
+# managed-mounts/prune pass — `ListManagedMounts` calls both `ListMounts` (GET
+# sys/mounts) and `ListAuth` (GET sys/auth) unconditionally. Drop this read and
+# the reconcile loop 403-crashloops the controller.
 path "sys/auth" {
   capabilities = ["read"]
 }
+# Enable / tune / disable auth method mounts. Only needed when the catalog declares
+# an auth-type plugin; a secrets-only manager can omit this wildcard entirely.
 path "sys/auth/*" {
   capabilities = ["create", "read", "update", "delete", "sudo"]
 }
@@ -140,6 +148,41 @@ vault write auth/kubernetes/role/vault-plugin-manager \
 ```
 
 Vault must be started with `plugin_directory` set to the path in `PLUGIN_DIR`.
+
+### Least-privilege variant
+
+The wildcards above are convenient but broad — `sys/mounts/*` lets the manager
+enable/tune/delete *any* secret engine, not just the ones it declares. To scope the
+policy to exactly the mounts in your config, replace the `sys/mounts/*` wildcard
+with an explicit **pair** of stanzas per managed mount:
+
+```hcl
+# For a managed secret mount at path "github":
+path "sys/mounts/github" {
+  capabilities = ["create", "read", "update", "delete"]
+}
+# SEPARATE exact-match path — the stanza above does NOT cover `.../tune`. The
+# manager calls TuneMount on mount-config drift or a `plugin_version` bump
+# (`ensureSecretMount` -> `TuneMountAllowNilWithContext`), so without this it 403s
+# on the next version bump. A fresh enable needs no tune, so a first-install run
+# won't surface it.
+path "sys/mounts/github/tune" {
+  capabilities = ["create", "read", "update"]
+}
+```
+
+Two things bite here, both because **Vault ACL paths are exact-match** (no implicit
+prefix nesting):
+
+1. **Grant `sys/auth` read regardless.** Keep the `sys/auth` read stanza even for a
+   secrets-only manager — the reconcile's prune pass lists auth mounts every loop
+   (see the comment on it above). You only drop the `sys/auth/*` *management*
+   wildcard.
+2. **Pair every mount with its `.../tune` subpath.** Adding a new backend to the
+   catalog + mounts config requires adding *both* `sys/mounts/<name>` and
+   `sys/mounts/<name>/tune` (auth-type plugins: `sys/auth/<name>` +
+   `sys/auth/<name>/tune`). Miss the `/tune` half and the manager enables the mount
+   fine but 403s the first time it tunes it.
 
 ## Kubernetes RBAC
 
