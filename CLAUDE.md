@@ -109,6 +109,13 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
 - **Reload uses global scope** so standby HA nodes pick up the new binary.
 - **Vault ACL needs `sudo`.** `sys/plugins/catalog/*` and `sys/plugins/reload/backend`
   are root-protected — the manager's policy must include `sudo` (see README ACL).
+- **Vault ACL least-privilege gotchas** (both from ACL paths being exact-match):
+  (1) `sys/auth` **read** is required even with zero managed auth mounts —
+  `ListManagedMounts` (`internal/vault/mounts.go`) calls `ListAuth` unconditionally
+  every reconcile for the prune pass; drop it and the loop 403-crashloops.
+  (2) Narrowing `sys/mounts/*` to per-mount paths must also grant `sys/mounts/<name>/tune`
+  — `ensureSecretMount` calls `TuneMount` (`.../tune`) on version/config drift, which
+  the bare `sys/mounts/<name>` path does not cover. See README "Least-privilege variant".
 - **OCI insecure registries.** `OCI_INSECURE` (flag/env) / chart `ociInsecure`
   lets the OCI fetcher pull from plain-HTTP / untrusted-TLS registries (e.g. the
   in-cluster registry the e2e uses). Off by default.
