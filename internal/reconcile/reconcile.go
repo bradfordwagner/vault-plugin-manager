@@ -29,6 +29,9 @@ type VaultOps interface {
 	DisableMount(ctx context.Context, path, mountType string) error
 	ListManagedMounts(ctx context.Context) ([]vault.ManagedMount, error)
 	ReloadPlugin(ctx context.Context, name string) error
+	EnsureRole(ctx context.Context, r vault.Role) error
+	ListRoles(ctx context.Context, mount, rolesPath string) ([]string, error)
+	DeleteRole(ctx context.Context, mount, rolesPath, name string) error
 }
 
 // PodOps is the subset of the Kubernetes client the reconciler uses.
@@ -153,8 +156,85 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 		r.log.With("plugin", name).Info("reloaded plugin")
 	}
 
-	// 4. Prune what left the spec.
+	// 4. Reconcile secret-engine roles (upsert declared roles; prune undeclared
+	//    ones on managed mounts under PruneFull).
+	if err := r.reconcileRoles(ctx, spec); err != nil {
+		return err
+	}
+
+	// 5. Prune what left the spec.
 	return r.prune(ctx, spec.Settings.PruneMode, pods, desiredMounts, desiredVersions)
+}
+
+// reconcileRoles upserts every declared role, then — only under PruneFull —
+// deletes any role on a managed mount that the spec does not declare. A managed
+// mount with no declared roles has ALL its roles pruned (strict source-of-truth,
+// consistent with mount PruneFull semantics).
+//
+// Roles are keyed by BOTH mount AND rolesPath, because a plugin may place roles
+// at a two-level, plugin-owned subpath (e.g. "realm/<realm>/roles") rather than
+// the classic "roles". vpm owns placement, the plugin owns the schema.
+//
+// LIMITATION (deliberate): the prune pass enumerates only the DISTINCT
+// rolesPaths that the ConfigMap DECLARES for each managed mount. A rolesPath
+// (e.g. a whole realm) that has ZERO declared roles in the ConfigMap is never
+// listed, so its stale roles are NOT pruned. This is a consequence of staying
+// plugin-agnostic: vpm cannot enumerate a plugin's realms/namespaces, so it
+// cannot discover a rolesPath that the spec does not mention. Do NOT "fix" this
+// by hardcoding realm (or any plugin-specific) enumeration.
+func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) error {
+	// Apply pass: upsert declared roles. desiredRoles maps normalized mount ->
+	// rolesPath -> set of desired role names, reused by the prune pass below.
+	desiredRoles := make(map[string]map[string]map[string]bool)
+	for _, role := range spec.Roles {
+		mount := strings.Trim(role.Mount, "/")
+		if err := r.vault.EnsureRole(ctx, vault.Role{
+			Mount:     role.Mount,
+			RolesPath: role.RolesPath,
+			Name:      role.Name,
+			Data:      role.Data,
+		}); err != nil {
+			return fmt.Errorf("reconcile: role %s/%s/%s: %w", mount, role.RolesPath, role.Name, err)
+		}
+		r.log.With("mount", mount, "rolesPath", role.RolesPath, "role", role.Name).Debug("ensured role")
+		if desiredRoles[mount] == nil {
+			desiredRoles[mount] = make(map[string]map[string]bool)
+		}
+		if desiredRoles[mount][role.RolesPath] == nil {
+			desiredRoles[mount][role.RolesPath] = make(map[string]bool)
+		}
+		desiredRoles[mount][role.RolesPath][role.Name] = true
+	}
+
+	// Role-prune pass: only when the ConfigMap is fully authoritative.
+	if spec.Settings.PruneMode != config.PruneFull {
+		return nil
+	}
+	managed, err := r.vault.ListManagedMounts(ctx)
+	if err != nil {
+		return fmt.Errorf("reconcile: listing managed mounts for role prune: %w", err)
+	}
+	for _, mm := range managed {
+		mount := strings.Trim(mm.Path, "/")
+		// Only the rolesPaths the spec declares for this mount are enumerated;
+		// see the LIMITATION note above.
+		for rolesPath, desired := range desiredRoles[mount] {
+			existing, err := r.vault.ListRoles(ctx, mount, rolesPath)
+			if err != nil {
+				return fmt.Errorf("reconcile: listing roles at %s/%s: %w", mount, rolesPath, err)
+			}
+			for _, name := range existing {
+				if desired[name] {
+					continue
+				}
+				if err := r.vault.DeleteRole(ctx, mount, rolesPath, name); err != nil {
+					return fmt.Errorf("reconcile: pruning role %s/%s/%s: %w", mount, rolesPath, name, err)
+				}
+				r.log.With("mount", mount, "rolesPath", rolesPath, "role", name).Info("pruned role")
+			}
+		}
+	}
+	return nil
 }
 
 // prune removes manager-owned mounts (and, per mode, their versions/binaries)
