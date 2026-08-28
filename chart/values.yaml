@@ -48,6 +48,28 @@ configMap:
       logLevel: info
     catalog: []
     mounts: []
+    # roles: secret-engine role bodies to UPSERT at <mount>/<rolesPath>/<name>.
+    # `data` is written verbatim to the plugin (vpm is schema-agnostic). Under
+    # pruneMode `full`, roles under a declared rolesPath on a managed mount that
+    # are not listed here are deleted.
+    #
+    # rolesPath (optional, default `roles`) is the path segment(s) BETWEEN the
+    # mount and the role name. The default reproduces the classic
+    # <mount>/roles/<name> layout; an override like `realm/<realm>/roles` places
+    # the role at <mount>/realm/<realm>/roles/<name> for plugins that use a
+    # deeper, plugin-owned role hierarchy.
+    #
+    #   roles:
+    #     - mount: example              # references a mounts[].path
+    #       name: reader                # role name (last path segment)
+    #       data:                       # written verbatim; the plugin owns the schema
+    #         ttl: "1h"
+    #     - mount: example
+    #       name: reader
+    #       rolesPath: realm/example/roles
+    #       data:
+    #         ttl: "1h"
+    roles: []
 
 # The manager needs get/list on pods and create on pods/exec, plus watch on the
 # ConfigMap. Set to false to supply your own RBAC.

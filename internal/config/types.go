@@ -16,6 +16,7 @@ type Spec struct {
 	Settings Settings       `yaml:"settings"`
 	Catalog  []CatalogEntry `yaml:"catalog"`
 	Mounts   []MountEntry   `yaml:"mounts"`
+	Roles    []RoleEntry    `yaml:"roles"`
 }
 
 // Settings are the runtime-tunable knobs sourced from the watched ConfigMap.
@@ -136,4 +137,20 @@ type MountEntry struct {
 type MountConfig struct {
 	Description string            `yaml:"description"`
 	Options     map[string]string `yaml:"options"`
+}
+
+// RoleEntry declares a secret-engine role to UPSERT at
+// <Mount>/<RolesPath>/<Name>. Data is written verbatim to the plugin, which owns
+// the schema. Role bodies are non-secret and git-owned; the engine's own
+// `config` is a separately-seeded zero-secret and is NEVER reconciled here.
+type RoleEntry struct {
+	Mount string `yaml:"mount"`
+	Name  string `yaml:"name"`
+	// RolesPath is the path segment(s) BETWEEN the mount and the role name.
+	// Optional; defaults to `roles`, which reproduces the classic
+	// <mount>/roles/<name> layout. An override like `realm/<realm>/roles` places
+	// the role at <mount>/realm/<realm>/roles/<name>. vpm stays plugin-agnostic:
+	// the plugin owns the schema, vpm owns placement.
+	RolesPath string         `yaml:"rolesPath"`
+	Data      map[string]any `yaml:"data"`
 }

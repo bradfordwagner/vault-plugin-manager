@@ -93,7 +93,32 @@ mounts:
     config:
       description: "Foo secrets engine"
       options: {}
+
+roles:                               # secret-engine role bodies to UPSERT (optional)
+  - mount: foo                       # references a mounts[].path
+    name: reader                     # role name (the last path segment)
+    data:                            # written verbatim; the plugin owns the schema
+      ttl: "1h"
+  - mount: foo
+    name: reader
+    rolesPath: realm/example/roles   # optional; default `roles`
+    data:
+      ttl: "1h"
 ```
+
+**`roles`** upserts each role at `<mount>/<rolesPath>/<name>`. `data` is written
+verbatim to the plugin, which owns the schema — vpm only owns *placement*.
+
+- **`rolesPath`** (optional, default `roles`) is the path segment(s) *between* the
+  mount and the role name. The default reproduces the classic `<mount>/roles/<name>`
+  layout. An override like `realm/<realm>/roles` places the role at
+  `<mount>/realm/<realm>/roles/<name>`, for plugins that use a deeper, plugin-owned
+  role hierarchy. It is trimmed of surrounding slashes; empty, `.`/`..`, or
+  double-slash segments are rejected.
+- Under `pruneMode: full`, a role under a *declared* `rolesPath` on a managed mount
+  that is not listed here is deleted. **Limitation:** a `rolesPath` the ConfigMap
+  never declares is never enumerated, so its stale roles are not pruned — vpm stays
+  plugin-agnostic and cannot discover role hierarchies it was not told about.
 
 ## Vault ACL policy
 

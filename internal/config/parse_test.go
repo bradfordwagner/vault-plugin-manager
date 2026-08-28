@@ -93,6 +93,101 @@ mounts:
 	}
 }
 
+func TestParseValidRoles(t *testing.T) {
+	raw := []byte(`
+catalog:
+  - name: vault-plugin-secrets-foo
+    type: secret
+    version: "0.3.1"
+    source:
+      url: https://example.com/foo.zip
+mounts:
+  - path: foo
+    plugin: vault-plugin-secrets-foo
+    type: secret
+    version: "0.3.1"
+roles:
+  - mount: foo
+    name: reader
+    data:
+      ttl: "1h"
+      policies:
+        - default
+        - read
+  - mount: /foo/
+    name: writer
+  - mount: foo
+    name: realm-reader
+    rolesPath: /realm/example/roles/
+`)
+	s, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(s.Roles) != 3 {
+		t.Fatalf("got roles=%d, want 3", len(s.Roles))
+	}
+	r0 := s.Roles[0]
+	if r0.Mount != "foo" || r0.Name != "reader" {
+		t.Fatalf("role[0] = %+v", r0)
+	}
+	// Omitted rolesPath defaults to the classic "roles" segment.
+	if r0.RolesPath != DefaultRolesPath {
+		t.Errorf("role[0].rolesPath = %q, want %q", r0.RolesPath, DefaultRolesPath)
+	}
+	// Nested data decodes to a map keyed by string.
+	if got, ok := r0.Data["ttl"].(string); !ok || got != "1h" {
+		t.Errorf("role[0].data[ttl] = %v (%T), want \"1h\"", r0.Data["ttl"], r0.Data["ttl"])
+	}
+	if _, ok := r0.Data["policies"].([]any); !ok {
+		t.Errorf("role[0].data[policies] = %v (%T), want []any", r0.Data["policies"], r0.Data["policies"])
+	}
+	// A role.mount with surrounding slashes still resolves to the declared mount.
+	if s.Roles[1].Name != "writer" {
+		t.Errorf("role[1].name = %q", s.Roles[1].Name)
+	}
+	if s.Roles[1].RolesPath != DefaultRolesPath {
+		t.Errorf("role[1].rolesPath = %q, want %q", s.Roles[1].RolesPath, DefaultRolesPath)
+	}
+	// An explicit rolesPath is trimmed of surrounding slashes and kept verbatim.
+	if s.Roles[2].RolesPath != "realm/example/roles" {
+		t.Errorf("role[2].rolesPath = %q, want %q", s.Roles[2].RolesPath, "realm/example/roles")
+	}
+}
+
+func TestParseInvalidRoles(t *testing.T) {
+	base := `
+catalog:
+  - name: p
+    type: secret
+    version: "1"
+    source: {url: https://x}
+mounts:
+  - path: foo
+    plugin: p
+    type: secret
+    version: "1"
+`
+	cases := map[string]string{
+		"missing mount":           base + "roles:\n  - name: reader\n",
+		"missing name":            base + "roles:\n  - mount: foo\n",
+		"unknown mount":           base + "roles:\n  - mount: bar\n    name: reader\n",
+		"name config":             base + "roles:\n  - mount: foo\n    name: config\n",
+		"name with slash":         base + "roles:\n  - mount: foo\n    name: a/b\n",
+		"rolesPath empty segment": base + "roles:\n  - mount: foo\n    name: reader\n    rolesPath: a//b\n",
+		"rolesPath dot segment":   base + "roles:\n  - mount: foo\n    name: reader\n    rolesPath: a/./b\n",
+		"rolesPath dotdot":        base + "roles:\n  - mount: foo\n    name: reader\n    rolesPath: a/../b\n",
+		"rolesPath only slashes":  base + "roles:\n  - mount: foo\n    name: reader\n    rolesPath: /\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(raw)); err == nil {
+				t.Fatalf("expected error for %q, got nil", name)
+			}
+		})
+	}
+}
+
 func TestParseInvalid(t *testing.T) {
 	cases := map[string]string{
 		"missing source": `
