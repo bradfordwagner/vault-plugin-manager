@@ -67,16 +67,62 @@ func New(cfg Config) (*Client, error) {
 	return &Client{api: c, cfg: cfg}, nil
 }
 
-// Authenticate performs the initial Kubernetes-auth login (failing fast on
-// misconfiguration) and then maintains the token in the background until ctx is
-// cancelled.
+// Initial-login retry bounds. During cluster ignition the Vault role that
+// authorizes this ServiceAccount may not exist yet: vault-config-operator
+// applies it separately, so the first login can transiently fail with a 403.
+// Rather than exiting and handing the wait to Kubernetes' CrashLoopBackOff —
+// which is stateful and backs off exponentially to ~5m, so recovery lags well
+// past when the role lands — Authenticate retries in-process on a bounded
+// backoff. A genuine misconfiguration still fails the pod once the overall
+// budget is exhausted.
+const (
+	initialLoginMaxBackoff = 15 * time.Second
+	initialLoginBudget     = 3 * time.Minute
+)
+
+// Authenticate performs the initial Kubernetes-auth login, retrying transient
+// failures in-process for up to initialLoginBudget before giving up, and then
+// maintains the token in the background until ctx is cancelled.
 func (c *Client) Authenticate(ctx context.Context) error {
-	secret, err := c.login(ctx)
+	secret, err := c.initialLogin(ctx)
 	if err != nil {
 		return err
 	}
 	go c.maintain(ctx, secret)
 	return nil
+}
+
+// initialLogin retries the first login on an exponential backoff (capped at
+// initialLoginMaxBackoff) until it succeeds, ctx is cancelled, or
+// initialLoginBudget elapses. On budget exhaustion it returns the last login
+// error so the process exits and the failure is surfaced loudly.
+func (c *Client) initialLogin(ctx context.Context) (*api.Secret, error) {
+	l := logging.Log().With("component", "vault-auth")
+	deadline := time.Now().Add(initialLoginBudget)
+	backoff := time.Second
+	retried := false
+	for {
+		secret, err := c.login(ctx)
+		if err == nil {
+			if retried {
+				l.Info("initial Vault login succeeded after retrying")
+			}
+			return secret, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("vault: initial login failed after %s: %w", initialLoginBudget, err)
+		}
+		retried = true
+		wait := backoff
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining // don't sleep past the budget
+		}
+		l.With("error", err).With("retry_in", wait.String()).Warn("initial Vault login failed; retrying")
+		if !sleepCtx(ctx, wait) {
+			return nil, ctx.Err()
+		}
+		backoff = nextBackoff(backoff, initialLoginMaxBackoff)
+	}
 }
 
 func (c *Client) login(ctx context.Context) (*api.Secret, error) {
@@ -175,10 +221,18 @@ func (c *Client) loginWithRetry(ctx context.Context, l *zap.SugaredLogger) (*api
 		if !sleepCtx(ctx, backoff) {
 			return nil, ctx.Err()
 		}
-		if backoff *= 2; backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+		backoff = nextBackoff(backoff, maxBackoff)
 	}
+}
+
+// nextBackoff doubles cur, clamped to max (and to max if cur is already at or
+// above it). Both bounds are assumed positive.
+func nextBackoff(cur, max time.Duration) time.Duration {
+	next := cur * 2
+	if next > max || next <= 0 {
+		return max
+	}
+	return next
 }
 
 // renewalLead returns how long to wait before re-login for a non-renewable

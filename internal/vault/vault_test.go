@@ -76,6 +76,23 @@ func TestNormPath(t *testing.T) {
 	}
 }
 
+func TestNextBackoff(t *testing.T) {
+	const max = 15 * time.Second
+	cases := []struct{ cur, want time.Duration }{
+		{time.Second, 2 * time.Second},
+		{4 * time.Second, 8 * time.Second},
+		{8 * time.Second, max},  // 16s would exceed the cap
+		{max, max},              // already at the cap
+		{30 * time.Second, max}, // above the cap
+		{1 << 62, max},          // doubling overflows to <=0
+	}
+	for _, c := range cases {
+		if got := nextBackoff(c.cur, max); got != c.want {
+			t.Errorf("nextBackoff(%v, %v) = %v, want %v", c.cur, max, got, c.want)
+		}
+	}
+}
+
 func TestRenewalLead(t *testing.T) {
 	if got := renewalLead(100 * time.Second); got != 90*time.Second {
 		t.Errorf("renewalLead(100s) = %v, want 90s", got)

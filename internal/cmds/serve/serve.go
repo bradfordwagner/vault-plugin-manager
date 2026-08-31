@@ -30,8 +30,9 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 	l := logging.Log().With("cmd", "serve")
 	l.With("config", redact(a)).Info("starting vault-plugin-manager")
 
-	// Vault client: authenticate now (fail fast) and keep the token maintained
-	// in the background until shutdown.
+	// Vault client: authenticate now (retrying a not-yet-authorized role for a
+	// bounded window, then failing) and keep the token maintained in the
+	// background until shutdown.
 	vc, err := vault.New(vault.Config{
 		Addr:       a.VaultAddr,
 		CACert:     a.VaultCACert,
