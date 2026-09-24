@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"vault-plugin-manager/internal/args"
+	"vault-plugin-manager/internal/config"
 	"vault-plugin-manager/internal/fetch"
+	"vault-plugin-manager/internal/health"
 	"vault-plugin-manager/internal/k8s"
 	"vault-plugin-manager/internal/logging"
 	"vault-plugin-manager/internal/reconcile"
@@ -16,6 +19,12 @@ import (
 
 // serviceAccountNamespaceFile is where the in-cluster namespace is projected.
 const serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// startupGrace is how long liveness holds before the reconcile loop has taken
+// over the watchdog. It must cover everything Run does first — the bounded
+// Vault login retry (3m) plus the informer cache sync — or a pod waiting on a
+// Vault role that has not landed yet gets restarted mid-wait.
+const startupGrace = 5 * time.Minute
 
 // Run wires up the server: it validates configuration, authenticates to Vault
 // and Kubernetes, then runs the reconcile loop until the context is cancelled.
@@ -30,6 +39,26 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 	l := logging.Log().With("cmd", "serve")
 	l.With("config", redact(a)).Info("starting vault-plugin-manager")
 
+	// Probe server first: Vault auth below retries for minutes during cluster
+	// ignition, and the kubelet must be able to see "up but not ready yet"
+	// rather than an unanswered port.
+	hs := health.New(health.Config{
+		StartupGrace: startupGrace,
+		// Replaced from the ConfigMap's settings on the first reconcile pass.
+		TokenGracePeriod: config.DefaultTokenGracePeriod,
+		TokenFailTimeout: config.DefaultTokenFailTimeout,
+		WatchGracePeriod: config.DefaultWatchGracePeriod,
+	})
+	if a.HealthAddr != "" {
+		stop, err := health.Serve(ctx, a.HealthAddr, hs)
+		if err != nil {
+			return err
+		}
+		defer stop()
+	} else {
+		l.Warn("health_addr is empty; liveness/readiness probes are disabled")
+	}
+
 	// Vault client: authenticate now (retrying a not-yet-authorized role for a
 	// bounded window, then failing) and keep the token maintained in the
 	// background until shutdown.
@@ -39,6 +68,9 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 		SkipVerify: a.VaultSkipVerify,
 		AuthMount:  a.VaultAuthMount,
 		Role:       a.VaultAuthRole,
+		// Token health feeds the probes: readiness drops after the ConfigMap's
+		// tokenGracePeriod, liveness after tokenFailTimeout.
+		TokenObserver: hs,
 	})
 	if err != nil {
 		return err
@@ -62,7 +94,7 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 		VaultContainer:   a.VaultContainer,
 		PluginDir:        a.PluginDir,
 	})
-	runner := reconcile.NewRunner(rec, kc, a.ConfigMapNamespace, a.ConfigMapName, a.ConfigMapKey)
+	runner := reconcile.NewRunner(rec, kc, a.ConfigMapNamespace, a.ConfigMapName, a.ConfigMapKey, hs)
 
 	l.Info("starting reconcile loop")
 	if err := runner.Run(ctx); err != nil {

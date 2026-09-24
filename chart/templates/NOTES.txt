@@ -14,3 +14,10 @@ Before it can work, ensure on the Vault side:
 
 Check status:
   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "vault-plugin-manager.fullname" . }}
+{{- if .Values.health.enabled }}
+
+The pod reports Ready only after its first clean reconcile pass, and its liveness
+probe is a watchdog on the reconcile loop (it fails if a pass stalls past
+settings.stallTimeout). Both endpoints return a JSON body explaining any failure:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "vault-plugin-manager.fullname" . }} -- wget -qO- localhost:{{ .Values.health.port }}/readyz
+{{- end }}

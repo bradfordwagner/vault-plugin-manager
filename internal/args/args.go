@@ -24,6 +24,11 @@ type ServeArgs struct {
 	VaultContainer   string `mapstructure:"VAULT_CONTAINER"`    // container name to exec into
 	PluginDir        string `mapstructure:"PLUGIN_DIR"`         // Vault plugin_directory path
 
+	// HealthAddr is the listen address for the liveness/readiness probe server
+	// (e.g. ":8080"). Empty disables the server entirely. Bootstrap config: the
+	// probes must answer before the ConfigMap has ever been read.
+	HealthAddr string `mapstructure:"HEALTH_ADDR"`
+
 	// OCIInsecure allows pulling plugin binaries from OCI registries served over
 	// plain HTTP / untrusted TLS (e.g. an in-cluster registry). Off by default.
 	OCIInsecure bool `mapstructure:"OCI_INSECURE"`

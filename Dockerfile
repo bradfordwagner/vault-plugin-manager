@@ -26,5 +26,8 @@ COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 COPY --from=build /out/vault-plugin-manager /usr/local/bin/vault-plugin-manager
 # Non-root numeric uid so Kubernetes runAsNonRoot is satisfied on scratch too.
 USER 65532:65532
+# Default HEALTH_ADDR port for the liveness/readiness probes (documentation only;
+# the address is configurable via HEALTH_ADDR / --health_addr).
+EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/vault-plugin-manager"]
 CMD ["serve"]

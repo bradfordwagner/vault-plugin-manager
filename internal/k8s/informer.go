@@ -2,10 +2,15 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"time"
 
+	"vault-plugin-manager/internal/logging"
+
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
@@ -14,17 +19,23 @@ import (
 
 // ConfigMapHandler receives events for the watched ConfigMap. OnChange fires on
 // add and update (including informer resyncs); OnDelete fires on removal.
+// OnWatchError fires when the underlying watch breaks in a way that is not part
+// of normal churn — see benignWatchError.
 type ConfigMapHandler struct {
-	OnChange func(*corev1.ConfigMap)
-	OnDelete func(namespace, name string)
+	OnChange     func(*corev1.ConfigMap)
+	OnDelete     func(namespace, name string)
+	OnWatchError func(error)
 }
 
 // WatchConfigMap runs a shared informer scoped to a single ConfigMap (by name,
 // via a field selector) and dispatches events to h. It blocks until the cache
-// has synced, then returns; events continue firing in the background until ctx
-// is cancelled. The resync period drives periodic OnChange calls, which the
-// caller uses to reconcile drift.
-func (c *Client) WatchConfigMap(ctx context.Context, ns, name string, resync time.Duration, h ConfigMapHandler) error {
+// has synced, then returns the informer; events continue firing in the
+// background until ctx is cancelled. The resync period drives periodic OnChange
+// calls, which the caller uses to reconcile drift.
+//
+// The returned informer is what the health probes interrogate: IsStopped reports
+// a watcher that has died outright, which no amount of waiting fixes.
+func (c *Client) WatchConfigMap(ctx context.Context, ns, name string, resync time.Duration, h ConfigMapHandler) (cache.SharedIndexInformer, error) {
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		c.clientset,
 		resync,
@@ -52,14 +63,49 @@ func (c *Client) WatchConfigMap(ctx context.Context, ns, name string, resync tim
 			}
 		},
 	}); err != nil {
-		return fmt.Errorf("k8s: adding configmap event handler: %w", err)
+		return nil, fmt.Errorf("k8s: adding configmap event handler: %w", err)
+	}
+
+	// Must be installed before the informer starts. It replaces client-go's
+	// default handler, so it logs as well as reporting.
+	l := logging.Log().With("component", "configmap-informer")
+	if err := informer.SetWatchErrorHandlerWithContext(func(_ context.Context, _ *cache.Reflector, err error) {
+		if benignWatchError(err) {
+			l.With("error", err).Debug("watch closed; relisting")
+			return
+		}
+		l.With("error", err).Warn("configmap watch failed")
+		if h.OnWatchError != nil {
+			h.OnWatchError(err)
+		}
+	}); err != nil {
+		return nil, fmt.Errorf("k8s: setting configmap watch error handler: %w", err)
 	}
 
 	factory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
-		return fmt.Errorf("k8s: configmap informer cache failed to sync")
+		return nil, fmt.Errorf("k8s: configmap informer cache failed to sync")
 	}
-	return nil
+	return informer, nil
+}
+
+// benignWatchError reports whether err is normal watch churn rather than a
+// broken watcher. The apiserver closes watches on a timer (client-go asks for a
+// randomized 5-10m timeout) and ages out resource versions; both cases relist
+// immediately, so treating them as failures would fire the probe constantly.
+// Mirrors client-go's own DefaultWatchErrorHandler classification.
+func benignWatchError(err error) bool {
+	switch {
+	case err == nil,
+		errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF),
+		errors.Is(err, context.Canceled),
+		apierrors.IsResourceExpired(err),
+		apierrors.IsGone(err):
+		return true
+	default:
+		return false
+	}
 }
 
 // asConfigMap extracts a ConfigMap from an informer object, unwrapping the

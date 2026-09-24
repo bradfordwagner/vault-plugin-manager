@@ -203,7 +203,17 @@ log "Installing manager chart"
 helm upgrade --install vpm ./chart -n "$NS" -f test/e2e/values.e2e.yaml
 # Force fresh pods so a reused cluster picks up a rebuilt image on the same tag.
 kubectl -n "$NS" rollout restart "deploy/${MANAGER_DEPLOY}"
+# rollout status now gates on the readiness probe, which only flips true after
+# the manager's first clean reconcile pass.
 kubectl -n "$NS" rollout status "deploy/${MANAGER_DEPLOY}" --timeout=180s
+
+# Prove both probe endpoints actually answer 200. The manager image has no
+# shell, so the request goes from the vault pod's busybox wget (-q exits
+# non-zero on the 503 an unhealthy manager returns).
+MGR_IP="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=vault-plugin-manager \
+  --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')"
+retry 60 "liveness probe 200"  vexec "wget -qO- http://${MGR_IP}:8080/healthz"
+retry 60 "readiness probe 200" vexec "wget -qO- http://${MGR_IP}:8080/readyz"
 
 ##### 8. assert the full chain #####
 log "Asserting plugins registered + mounts working"
@@ -229,5 +239,10 @@ retry 60  "oci plugin deregistered" bash -c "! kubectl -n $NS exec -i $VPOD -- e
 # http mount must survive the prune.
 vexec 'vault secrets list | grep -q "^e2e-http/"'
 echo "ok: OCI pruned, HTTP mount retained"
+
+# The change log must name WHICH part of the ConfigMap moved, not just that it
+# changed; the reconciler's own action logs then follow.
+retry 60 "configmap change logged with the removed mount" bash -c \
+  "kubectl -n $NS logs deploy/${MANAGER_DEPLOY} --tail=-1 | grep -q 'configmap change: mounts secret:e2e-oci removed'"
 
 log "E2E PASSED for Vault ${VAULT_VERSION}"

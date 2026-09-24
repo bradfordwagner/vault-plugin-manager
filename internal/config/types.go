@@ -30,6 +30,24 @@ type Settings struct {
 	ResyncInterval Duration `yaml:"resyncInterval"`
 	// LogLevel is the server log verbosity: debug | info | warn | error.
 	LogLevel string `yaml:"logLevel"`
+	// StallTimeout bounds how long a single reconcile pass may run before the
+	// liveness probe calls the loop wedged and Kubernetes restarts the pod. It
+	// must exceed the slowest legitimate pass (fetching a large plugin and
+	// exec-copying it to every Vault pod), or healthy managers get killed.
+	StallTimeout Duration `yaml:"stallTimeout"`
+	// TokenGracePeriod is how long the Vault token may stay invalid — login or
+	// renewal failing — before the readiness probe reports the manager unable to
+	// do its job. It absorbs brief Vault restarts without flapping the pod.
+	TokenGracePeriod Duration `yaml:"tokenGracePeriod"`
+	// TokenFailTimeout is how long the Vault token may stay invalid before the
+	// liveness probe gives up on the in-process re-login loop and lets
+	// Kubernetes restart the pod. Must be >= TokenGracePeriod.
+	TokenFailTimeout Duration `yaml:"tokenFailTimeout"`
+	// WatchGracePeriod is how long the ConfigMap watch may keep failing —
+	// erroring but still relisting — before the readiness probe reports it. A
+	// watcher that has stopped outright fails liveness immediately instead, with
+	// no grace: nothing in-process will restart it.
+	WatchGracePeriod Duration `yaml:"watchGracePeriod"`
 }
 
 // PruneMode controls removal behavior when an owned mount/version leaves the ConfigMap.
@@ -57,6 +75,19 @@ const (
 	DefaultPruneMode      = PruneFull
 	DefaultResyncInterval = 5 * time.Minute
 	DefaultLogLevel       = "info"
+	DefaultStallTimeout   = 10 * time.Minute
+
+	// Token health windows. Readiness reacts quickly (a manager that cannot talk
+	// to Vault is not doing its job); liveness waits much longer, because
+	// restarting the pod does not fix a Vault that is down, it only re-runs the
+	// same login the maintain loop is already retrying.
+	DefaultTokenGracePeriod = 2 * time.Minute
+	DefaultTokenFailTimeout = 15 * time.Minute
+
+	// DefaultWatchGracePeriod covers client-go's own recovery: it asks for a
+	// randomized 5-10m watch timeout and relists on failure, so a watch that is
+	// still failing after this long is not recovering on its own.
+	DefaultWatchGracePeriod = 2 * time.Minute
 )
 
 // ApplyDefaults fills unset settings with their defaults.
@@ -69,6 +100,18 @@ func (s *Settings) ApplyDefaults() {
 	}
 	if s.LogLevel == "" {
 		s.LogLevel = DefaultLogLevel
+	}
+	if s.StallTimeout == 0 {
+		s.StallTimeout = Duration(DefaultStallTimeout)
+	}
+	if s.TokenGracePeriod == 0 {
+		s.TokenGracePeriod = Duration(DefaultTokenGracePeriod)
+	}
+	if s.TokenFailTimeout == 0 {
+		s.TokenFailTimeout = Duration(DefaultTokenFailTimeout)
+	}
+	if s.WatchGracePeriod == 0 {
+		s.WatchGracePeriod = Duration(DefaultWatchGracePeriod)
 	}
 }
 

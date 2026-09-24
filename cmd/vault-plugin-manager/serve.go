@@ -3,6 +3,7 @@ package main
 import (
 	"vault-plugin-manager/internal/args"
 	"vault-plugin-manager/internal/cmds/serve"
+	"vault-plugin-manager/internal/health"
 
 	"github.com/bradfordwagner/go-util/flag_helper"
 	"github.com/spf13/cobra"
@@ -31,6 +32,9 @@ func init() {
 	flag_helper.CreateFlag(fs, &serveArgs.VaultContainer, "vault_container", "", "vault", "Vault container name to exec into (env VAULT_CONTAINER)")
 	flag_helper.CreateFlag(fs, &serveArgs.PluginDir, "plugin_dir", "", "/vault/plugins", "Vault plugin_directory path (env PLUGIN_DIR)")
 	flag_helper.CreateFlag(fs, &serveArgs.OCIInsecure, "oci_insecure", "", false, "Allow OCI pulls from plain-HTTP/untrusted-TLS registries (env OCI_INSECURE)")
+
+	// Liveness / readiness probe server
+	flag_helper.CreateFlag(fs, &serveArgs.HealthAddr, "health_addr", "", health.DefaultAddr, "Listen address for the liveness/readiness probe server; empty disables it (env HEALTH_ADDR)")
 
 	// NOTE: runtime tunables (pruneMode, resyncInterval, logLevel) are sourced
 	// from the watched ConfigMap's `settings` block, not from flags/env.
