@@ -17,6 +17,18 @@ vault:
   container: vault
   pluginDir: /vault/plugins
 
+# The fetchers hold the whole plugin binary in memory (download buffer plus the
+# extracted binary, plus a buffered OCI layer), so the chart's 128Mi default is
+# marginal even for the small test plugin — it OOMKilled mid-fetch on 2 of 3
+# matrix legs. Give the e2e headroom so a restart cannot mask a real failure.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
 # Pull the test plugin image from the in-cluster registry over plain HTTP.
 ociInsecure: true
 
