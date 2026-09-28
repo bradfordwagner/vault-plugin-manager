@@ -44,7 +44,7 @@ tasks:
       - watchexec -cr -e go -- task test
 
   e2e:
-    desc: 'End-to-end test on kind against real Vault. Usage: task e2e -- 1.20.4'
+    desc: 'End-to-end test on kind against real Vault. Usage: task e2e -- 2.1.1'
     cmds:
       - test/e2e/run.sh {{.CLI_ARGS}}
 

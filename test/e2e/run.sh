@@ -7,10 +7,10 @@
 # exec-copy -> register -> enable mount -> write/read a secret, then prune.
 #
 # Usage:   test/e2e/run.sh [VAULT_VERSION]
-# Env:     VAULT_VERSION (default 1.18.5), KIND_CLUSTER, KEEP=1 (don't tear down)
+# Env:     VAULT_VERSION (default 2.1.1), KIND_CLUSTER, KEEP=1 (don't tear down)
 set -euo pipefail
 
-VAULT_VERSION="${1:-${VAULT_VERSION:-1.18.5}}"
+VAULT_VERSION="${1:-${VAULT_VERSION:-2.1.1}}"
 VAULT_IMAGE="hashicorp/vault:${VAULT_VERSION}"
 CLUSTER="${KIND_CLUSTER:-vpm-e2e}"
 NS=e2e
