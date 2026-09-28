@@ -26,7 +26,7 @@ Configuration is split in two:
 - **Bootstrap config** — how to reach Kubernetes and Vault and which ConfigMap to
   watch. Needed *before* the ConfigMap can be read, so it comes from flags/env
   on the `serve` command (flag is lowercase, env is uppercase, same name).
-- **Runtime tunables** — `pruneMode`, `resyncInterval`, `logLevel`. These live in
+- **Runtime tunables** — `pruneMode`, `resyncInterval`, `logLevel`, `stallTimeout`. These live in
   the watched ConfigMap's `settings:` block and are re-read on every reconcile,
   so they can be changed by editing the ConfigMap without redeploying.
 
@@ -45,6 +45,7 @@ Configuration is split in two:
 | `VAULT_NAMESPACE` | own namespace | where Vault pods run |
 | `VAULT_CONTAINER` | `vault` | container to exec into |
 | `PLUGIN_DIR` | `/vault/plugins` | Vault `plugin_directory` |
+| `HEALTH_ADDR` | `:8080` | liveness/readiness listen address; empty disables |
 
 ### Runtime tunables (ConfigMap `settings:`)
 
@@ -53,6 +54,10 @@ Configuration is split in two:
 | `pruneMode` | `full` | removal behavior — see below |
 | `resyncInterval` | `5m` | periodic full drift reconcile (Go duration) |
 | `logLevel` | `info` | `debug` \| `info` \| `warn` \| `error` |
+| `stallTimeout` | `10m` | how long one reconcile pass may run before liveness fails |
+| `tokenGracePeriod` | `2m` | how long the Vault token may be invalid before readiness drops |
+| `tokenFailTimeout` | `15m` | how long the Vault token may be invalid before liveness drops |
+| `watchGracePeriod` | `2m` | how long the ConfigMap watch may fail before readiness drops |
 
 **`pruneMode`** controls what happens when a mount or plugin version the manager
 owns is removed from the ConfigMap:
@@ -119,6 +124,105 @@ verbatim to the plugin, which owns the schema — vpm only owns *placement*.
   that is not listed here is deleted. **Limitation:** a `rolesPath` the ConfigMap
   never declares is never enumerated, so its stale roles are not pruned — vpm stays
   plugin-agnostic and cannot discover role hierarchies it was not told about.
+
+## Health probes
+
+The manager serves no traffic, so "healthy" is defined by its reconcile loop, not
+by request handling. Two endpoints on `HEALTH_ADDR` (`:8080` by default) answer
+`200` when the probed condition holds and `503` — with a JSON body explaining why
+— when it does not:
+
+| Endpoint | Probe | Semantics |
+|----------|-------|-----------|
+| `/healthz` | liveness | A **watchdog on the reconcile loop**, plus the Vault token and the ConfigMap watcher. Before each wait the loop declares when its next signal is due (`resyncInterval + stallTimeout` while idle, `stallTimeout` while a pass runs). A loop stuck on a hung exec, fetch, or Vault call misses that deadline. It also fails once the Vault token has been invalid for `tokenFailTimeout`, or the ConfigMap informer has stopped. |
+| `/readyz` | readiness | A **startup gate**, plus the Vault token and the ConfigMap watch. It flips true on the first clean reconcile pass, so `helm --wait` / `kubectl rollout status` gates on the manager actually reconciling. It drops again while the Vault token has been invalid for longer than `tokenGracePeriod`, or the watch has been failing for longer than `watchGracePeriod`. Reconcile errors appear in the body's `lastError` but do not unready the pod, so a transient error doesn't flap the rollout. |
+
+### Vault token health
+
+A manager that can't authenticate to Vault can't do its job, so both probes watch
+the token. State comes from the client's login/renew loop — authoritative for the
+token lifecycle — and is graced twice over:
+
+| Token invalid for | Readiness | Liveness | Why |
+|---|:-:|:-:|---|
+| `< tokenGracePeriod` (2m) | ✅ | ✅ | Absorbs a Vault restart or a brief renew failure without flapping the pod. |
+| `> tokenGracePeriod` | ❌ | ✅ | The manager is not working; say so. Restarting it wouldn't help — the client is already retrying login on a backoff. |
+| `> tokenFailTimeout` (15m) | ❌ | ❌ | Last resort: assume the in-process re-login loop is itself stuck and let Kubernetes restart the pod. |
+
+A successful re-login clears both immediately. Repeated failures don't restart the
+grace clock, so a login retrying every second can't hold the probes green. The
+probe body carries `tokenValid`, `tokenInvalidFor`, and `tokenError`.
+
+`tokenFailTimeout` must be `>=` `tokenGracePeriod` (validated on parse): liveness
+has to outlast readiness, or the pod gets restarted before it's ever reported
+unready.
+
+### ConfigMap watcher health
+
+The reconcile loop runs on its own timer and reconciles whatever the informer
+cache holds, so a dead watcher is invisible from the outside: the loop keeps
+ticking, reconciles stale content successfully, and every probe stays green while
+ConfigMap edits are silently ignored. Two checks close that:
+
+| Failure | Detected by | Effect |
+|---|---|---|
+| Informer stopped outright | `informer.IsStopped()`, polled per probe request | **Liveness fails immediately.** No grace — nothing in-process restarts an informer, so only a pod restart fixes it. |
+| Watch erroring, still relisting | client-go's watch-error handler | **Readiness fails after `watchGracePeriod`.** Liveness is untouched: client-go usually relists its way out. |
+
+Normal watch churn is not counted. client-go asks for a randomized 5-10m watch
+timeout and relists when a resource version ages out, so `io.EOF`,
+`ErrUnexpectedEOF`, `410 Gone`, and resource-expired errors are classified benign
+(mirroring client-go's own `DefaultWatchErrorHandler`) and logged at debug. Any
+delivered event — a real change or a relist — clears a recorded watch failure.
+
+What this still does **not** catch: a watch that the API server considers alive
+but which silently delivers nothing. Detecting that needs a periodic direct `GET`
+of the ConfigMap compared against the cache, which is not implemented.
+
+Notes:
+
+- The probe server starts **before** the Vault login, which retries for up to 3
+  minutes during cluster ignition. A pod waiting on a Vault role that hasn't
+  landed yet therefore reports live-but-not-ready rather than an unanswered port.
+- An absent, empty, or unparseable ConfigMap counts as a *clean* pass: that's the
+  spec being wrong, not the manager being broken. The skip is logged; readiness
+  is not withheld for it.
+- `stallTimeout` must exceed the slowest legitimate pass — fetching a large
+  plugin and exec-copying it to every Vault pod — or healthy managers get killed.
+
+```console
+$ kubectl exec -it deploy/vault-plugin-manager -- wget -qO- localhost:8080/readyz
+{"live":true,"ready":true,"uptime":"12m30s","lastPass":"2026-09-24T18:02:11Z","tokenValid":true,"watcherRunning":true}
+
+# Vault down for four minutes: not ready, still live, and the body says why.
+{"live":true,"ready":false,"reason":"Vault token invalid for 4m2s (grace 2m0s)",
+ "uptime":"31m","lastPass":"2026-09-24T18:28:40Z","lastError":"vault: reading mounts: connection refused",
+ "tokenValid":false,"tokenInvalidFor":"4m2s","tokenError":"vault: kubernetes login: connection refused","watcherRunning":true}
+```
+
+## Change logging
+
+Every reconcile logs **what changed in the ConfigMap** before the reconciler logs
+**what it did about it**. Changes are keyed the way the reconciler keys them, so a
+line maps to the work it causes: `name@version` for catalog entries (versions
+coexist, so a bump reads as a remove plus an add), `type:path` for mounts, and
+`mount/rolesPath/name` for roles.
+
+```
+INFO  configmap change: catalog foo@1.1.0 added: type=secret, url=https://…/foo.tar.gz  section=catalog key=foo@1.1.0 action=added
+INFO  configmap change: mounts secret:foo changed: version 1.0.0 -> 1.1.0             section=mounts  key=secret:foo action=changed
+INFO  reconciling configmap changes   trigger=configmap changes=2
+INFO  copied plugin binary            plugin=foo version=1.1.0 pod=vault-0
+INFO  registered plugin version       plugin=foo version=1.1.0
+INFO  reconciled mount                mount=foo version=1.1.0
+INFO  reloaded plugin                 plugin=foo
+```
+
+Each change is logged once, not on every resync: a pass that finds nothing new
+logs at `debug` only. Section, key, and action are also emitted as structured
+fields (stable strings — grep them). Role bodies are the plugin's schema, so a
+role change reports *which keys* moved, not their values. The first spec after
+startup — or after the ConfigMap reappears — reports every entry as `added`.
 
 ## Vault ACL policy
 
@@ -232,3 +336,17 @@ helm install vault-plugin-manager ./chart \
 ```
 
 See [`chart/values.yaml`](./chart/values.yaml) for all values.
+
+Probes are on by default and fully overridable — the `health.livenessProbe` /
+`health.readinessProbe` maps are rendered verbatim into the container, so any
+field a Kubernetes probe accepts can be set:
+
+```sh
+helm upgrade vault-plugin-manager ./chart \
+  --set health.port=9090 \
+  --set health.livenessProbe.periodSeconds=60 \
+  --set health.livenessProbe.failureThreshold=5
+```
+
+`health.enabled=false` drops both probes, the container port, and the probe
+server itself (`HEALTH_ADDR=""`).

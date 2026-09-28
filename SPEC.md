@@ -63,6 +63,15 @@ toward the ConfigMap regardless of what changed.
 
 ---
 
+**Change logging.** Each pass logs the ConfigMap diff (`config.Diff`) before
+acting: one line per change, keyed as the reconciler keys entries
+(`name@version`, `type:path`, `mount/rolesPath/name`), with section / key /
+action as structured fields. The reconciler's own logs then record the work
+performed. A change is logged once, not on every resync; role changes report
+which data keys moved, never the values.
+
+---
+
 ## 3. ConfigMap schema
 
 One data key (e.g. `plugins.yaml`):
@@ -123,6 +132,7 @@ ConfigMap can be read:
 | `vault_namespace` | own namespace | where Vault pods run |
 | `vault_container` | `vault` | container name to exec into |
 | `plugin_dir` | `/vault/plugins` | Vault `plugin_directory` path |
+| `health_addr` | `:8080` | liveness/readiness listen address; empty disables the probe server |
 
 **Runtime tunables** — live in the watched ConfigMap's `settings:` block, re-read
 each reconcile so they change without a redeploy:
@@ -132,6 +142,38 @@ each reconcile so they change without a redeploy:
 | `pruneMode` | `full` | `full` \| `deregister` \| `never` (see §2 step 6) |
 | `resyncInterval` | `5m` | periodic drift reconcile |
 | `logLevel` | `info` | `debug` \| `info` \| `warn` \| `error` |
+| `stallTimeout` | `10m` | how long one reconcile pass may run before liveness calls the loop wedged |
+| `tokenGracePeriod` | `2m` | how long the Vault token may be invalid before readiness drops |
+| `tokenFailTimeout` | `15m` | how long the Vault token may be invalid before liveness drops (must be >= grace) |
+| `watchGracePeriod` | `2m` | how long the ConfigMap watch may fail before readiness drops |
+
+**Health probes** (`internal/health`, served on `health_addr`):
+
+- `/healthz` (liveness) is a watchdog on the reconcile loop, not an HTTP
+  echo — the manager serves no traffic, so "responding" has to mean "the loop
+  is turning". The Runner declares its next deadline before each wait
+  (`resyncInterval + stallTimeout`) and before each pass (`stallTimeout`);
+  missing it returns 503 and the kubelet restarts the pod.
+- `/readyz` (readiness) is a startup gate: true on the first clean pass, then
+  sticky for reconcile errors, so rollouts gate on a real reconcile without
+  flapping on a transient Vault error. An absent/unparseable ConfigMap counts as
+  clean — that's the user's spec, not a broken manager.
+- **Vault token health feeds both probes.** The client's login/renew loop
+  reports through a `vault.TokenObserver`; `health.State` implements it. Readiness
+  drops once the token has been invalid for `tokenGracePeriod`, liveness only
+  after `tokenFailTimeout` — restarting the pod does not fix a Vault that is
+  down, it only re-runs the login the client already retries on a backoff.
+  Repeated failures do not restart the grace clock.
+- **ConfigMap watcher health feeds both probes.** `WatchConfigMap`
+  (`internal/k8s/informer.go`) returns the informer; a stopped informer
+  (`IsStopped`) fails liveness immediately, since the loop would otherwise
+  reconcile its stale cache forever while looking healthy. A watch that is
+  erroring but still relisting fails readiness after `watchGracePeriod`; normal
+  churn (EOF, 410 Gone, resource expired) is classified benign, mirroring
+  client-go. NOT covered: a watch that is alive but silently delivers nothing —
+  that needs a periodic ground-truth GET, deliberately not built.
+- The server starts before the Vault login so the bounded ignition retry (3m)
+  reports live-but-not-ready instead of an unanswered port.
 
 Command shape: `vault-plugin-manager serve` (long-running). A `reconcile` one-shot
 subcommand is a nice-to-have for CI/debugging.
@@ -208,7 +250,8 @@ Templates:
 
 Key `values.yaml`: image repo/tag, `vault.addr`, `vault.authRole`, `vault.authMount`,
 `vault.podSelector`, `plugin.dir`, `resyncInterval`, `pruneMode`, `configMap.name`,
-resources, TLS settings.
+resources, TLS settings, and `health` (`enabled`, `port`, and the `livenessProbe`
+/ `readinessProbe` maps, rendered verbatim so any probe field can be overridden).
 
 ---
 
@@ -223,6 +266,7 @@ internal/vault/                  # k8s-auth client, catalog, mounts, reload
 internal/k8s/                    # pod discovery + exec-copy
 internal/fetch/                  # PluginFetcher interface + http + oci impls
 internal/reconcile/             # the reconcile loop
+internal/health/                 # liveness/readiness probe server
 chart/                           # Helm chart
 ```
 

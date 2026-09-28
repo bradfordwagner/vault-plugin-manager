@@ -48,15 +48,19 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
 - `cmd/vault-plugin-manager/` — cobra root + `serve` subcommand; flag/env wiring.
 - `internal/args/` — `ServeArgs` bootstrap config struct.
 - `internal/config/` — watched ConfigMap schema (`settings` + `catalog` + `mounts`),
-  parse + validate. Runtime tunables live here, not in flags.
+  parse + validate (`parse.go`, `types.go`), and the spec differ used for change
+  logging (`diff.go`). Runtime tunables live here, not in flags.
 - `internal/vault/` — Vault client: k8s-auth login with background renew/re-login
   (`client.go`), catalog (`catalog.go`), mounts (`mounts.go`), reload (`reload.go`).
 - `internal/k8s/` — clientset (`client.go`), pod discovery + exec-copy transport
-  (`pods.go`), ConfigMap informer (`informer.go`).
+  (`pods.go`), ConfigMap informer (`informer.go`, which returns the informer so
+  the probes can interrogate it).
 - `internal/fetch/` — the `Fetcher`: HTTPS + archive extraction (`http.go`), OCI
   via go-containerregistry (`oci.go`), sha256 verify (`fetch.go`).
 - `internal/reconcile/` — the idempotent, level-triggered loop (`reconcile.go`)
   and the informer/timer `Runner` (`runner.go`).
+- `internal/health/` — liveness/readiness probe server (`health.go`): a watchdog
+  `State` the reconcile Runner heartbeats, served on `HEALTH_ADDR`.
 - `internal/logging/` — shared zap logger with a runtime-settable atomic level.
 - `chart/` — Helm chart (deployment, serviceaccount, RBAC, optional ConfigMap).
 - `Dockerfile` (root) — multi-stage: builds with the owned Go builder, slices the
@@ -69,9 +73,12 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
 
 - **Config split by lifecycle.** *Bootstrap* config (Vault addr, k8s auth role,
   which ConfigMap to watch, pod selector, plugin dir) comes from flags/env because
-  it's needed before the ConfigMap can be read. *Runtime tunables* (`pruneMode`,
-  `resyncInterval`, `logLevel`) live in the ConfigMap's `settings:` block and are
-  re-read every reconcile — changeable without a redeploy.
+  it's needed before the ConfigMap can be read — as is `health_addr`, since the
+  probes must answer before the ConfigMap has ever been read. *Runtime tunables*
+  (`pruneMode`, `resyncInterval`, `logLevel`, `stallTimeout`,
+  `tokenGracePeriod`, `tokenFailTimeout`, `watchGracePeriod`) live in the
+  ConfigMap's `settings:` block and are re-read every reconcile — changeable
+  without a redeploy.
 - **flag_helper pattern.** Flags are registered with
   `github.com/bradfordwagner/go-util/flag_helper` (supports string/bool/int/
   Duration only). Convention: lowercase flag name (`vault_addr`) ↔ uppercase
@@ -116,6 +123,41 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   (2) Narrowing `sys/mounts/*` to per-mount paths must also grant `sys/mounts/<name>/tune`
   — `ensureSecretMount` calls `TuneMount` (`.../tune`) on version/config drift, which
   the bare `sys/mounts/<name>` path does not cover. See README "Least-privilege variant".
+- **Liveness is a watchdog, not an echo.** The manager serves no traffic, so
+  `/healthz` reports on the reconcile loop: the Runner calls `Heartbeat` with its
+  next deadline before each wait (`resyncInterval + stallTimeout`) and before
+  each pass (`stallTimeout`), and liveness 503s once that passes. Don't "fix" it
+  into a static 200 — a loop wedged on a hung exec/fetch/Vault call is exactly
+  the failure it exists to catch. `/readyz` is a sticky startup gate (true on the
+  first clean pass) so rollouts gate on a real reconcile without flapping on a
+  transient Vault error; a skipped pass (absent/invalid ConfigMap) counts as
+  clean. The probe server starts **before** the Vault login so the bounded
+  ignition retry reports live-but-not-ready, not a dead port.
+- **Vault token health feeds both probes, graced twice.** The client's
+  login/renew loop reports through `vault.TokenObserver` (`internal/vault/client.go`);
+  `health.State` implements it. Readiness drops after `tokenGracePeriod` (2m) —
+  a manager that cannot authenticate is not working — liveness only after
+  `tokenFailTimeout` (15m), because restarting the pod does not fix a Vault that
+  is down, it only re-runs the login the client already retries. Repeated
+  failures must NOT restart the grace clock, or a login retrying every second
+  holds the probes green forever (`TokenInvalid` guards this; there is a test).
+- **A dead ConfigMap watcher is the quiet failure.** The Runner reconciles on its
+  own timer from the informer cache, so a dead watcher looks perfectly healthy:
+  loop ticking, reconciles succeeding on stale content, edits ignored. Hence
+  `informer.IsStopped()` fails liveness with NO grace (nothing in-process
+  restarts an informer), while a watch that errors but still relists fails only
+  readiness, after `watchGracePeriod`. Benign churn (EOF, 410 Gone, resource
+  expired) must stay classified benign in `benignWatchError` — client-go asks for
+  a randomized 5-10m watch timeout, so counting those would fire the probe
+  constantly. Any delivered event clears a recorded failure.
+- **Change logging: diff first, then actions.** `config.Diff` (`internal/config/diff.go`)
+  reports what moved in the ConfigMap and the Runner logs one Info line per
+  change before reconciling; the reconciler's existing logs record the work. Diff
+  keys MATCH the reconciler's keys (`catalogKey`/`nvKey` = `name@version`,
+  `mountDiffKey`/`mountKey` = `type:path`) so a logged change maps to the work it
+  causes — keep them in sync. The Runner tracks the last-logged spec so a change
+  is reported once, not every resync. Role changes log which `data` keys moved,
+  never the values (the plugin owns that schema).
 - **OCI insecure registries.** `OCI_INSECURE` (flag/env) / chart `ociInsecure`
   lets the OCI fetcher pull from plain-HTTP / untrusted-TLS registries (e.g. the
   in-cluster registry the e2e uses). Off by default.

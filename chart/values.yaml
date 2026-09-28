@@ -17,6 +17,43 @@ vault:
   container: vault
   pluginDir: /vault/plugins
 
+# Liveness / readiness probes. The manager serves no traffic, so these endpoints
+# exist purely so Kubernetes can tell a working manager from a wedged one:
+#   /healthz (liveness)  - fails when the reconcile loop misses its deadline
+#                          (resyncInterval + settings.stallTimeout), when the
+#                          Vault token has been invalid for
+#                          settings.tokenFailTimeout, or when the ConfigMap
+#                          watcher has stopped outright.
+#   /readyz  (readiness) - flips true on the first clean reconcile pass, so
+#                          `helm --wait` / `rollout status` gates on the manager
+#                          actually reconciling. It drops while the Vault token
+#                          has been invalid for settings.tokenGracePeriod, or the
+#                          ConfigMap watch has been failing for
+#                          settings.watchGracePeriod. Reconcile errors are
+#                          reported in the response body but do not unready the
+#                          pod.
+# Both probes are rendered verbatim, so any field a Kubernetes probe accepts can
+# be set here; `port: health` refers to the named container port below.
+health:
+  enabled: true
+  port: 8080
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    initialDelaySeconds: 10
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: health
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
 # OCI pulls: allow plain-HTTP / untrusted-TLS registries (e.g. an in-cluster
 # registry used for testing). Leave false in production.
 ociInsecure: false
@@ -46,6 +83,22 @@ configMap:
       resyncInterval: 5m
       # logLevel: debug | info | warn | error
       logLevel: info
+      # stallTimeout: how long one reconcile pass may run before the liveness
+      # probe calls the loop wedged and Kubernetes restarts the pod. Raise it if
+      # a legitimate pass (large plugin, many Vault pods) can take longer.
+      stallTimeout: 10m
+      # tokenGracePeriod: how long the Vault token may stay invalid (login or
+      # renewal failing) before the pod reports NOT ready.
+      tokenGracePeriod: 2m
+      # tokenFailTimeout: how long the Vault token may stay invalid before the
+      # pod reports NOT live and Kubernetes restarts it. Must be >=
+      # tokenGracePeriod; keep it long, because a restart does not fix a Vault
+      # that is down.
+      tokenFailTimeout: 15m
+      # watchGracePeriod: how long the ConfigMap watch may keep failing (erroring
+      # but still relisting) before the pod reports NOT ready. A watcher that has
+      # stopped outright fails liveness immediately, with no grace.
+      watchGracePeriod: 2m
     catalog: []
     mounts: []
     # roles: secret-engine role bodies to UPSERT at <mount>/<rolesPath>/<name>.

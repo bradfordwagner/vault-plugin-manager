@@ -147,6 +147,19 @@ func (s Settings) validate() error {
 	if s.ResyncInterval.Duration() <= 0 {
 		return fmt.Errorf("settings: resyncInterval must be positive")
 	}
+	if s.StallTimeout.Duration() <= 0 {
+		return fmt.Errorf("settings: stallTimeout must be positive")
+	}
+	if s.TokenGracePeriod.Duration() <= 0 {
+		return fmt.Errorf("settings: tokenGracePeriod must be positive")
+	}
+	if s.WatchGracePeriod.Duration() <= 0 {
+		return fmt.Errorf("settings: watchGracePeriod must be positive")
+	}
+	if s.TokenFailTimeout.Duration() < s.TokenGracePeriod.Duration() {
+		return fmt.Errorf("settings: tokenFailTimeout (%s) must be >= tokenGracePeriod (%s); liveness must outlast readiness",
+			s.TokenFailTimeout.Duration(), s.TokenGracePeriod.Duration())
+	}
 	return nil
 }
 

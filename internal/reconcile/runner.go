@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,37 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
+// Health receives the Runner's liveness and readiness signals.
+// *health.State implements it; a nil Health is accepted and ignored.
+type Health interface {
+	// Heartbeat declares that the Runner's next signal is due within d.
+	Heartbeat(d time.Duration)
+	// ReconcileDone reports the outcome of one pass; nil means a clean pass.
+	ReconcileDone(err error)
+	// SetTokenGrace applies the ConfigMap's Vault-token health windows.
+	SetTokenGrace(grace, failAfter time.Duration)
+	// SetWatchGrace applies the ConfigMap's watch-error window.
+	SetWatchGrace(grace time.Duration)
+	// SetWatcherCheck installs an on-demand check for a stopped watcher.
+	SetWatcherCheck(fn func() error)
+	// WatchError reports a broken ConfigMap watch.
+	WatchError(err error)
+	// WatchHealthy reports a delivered event, which proves the watch works.
+	WatchHealthy()
+}
+
+// noopHealth drops every signal, for callers (and tests) running without
+// health probes.
+type noopHealth struct{}
+
+func (noopHealth) Heartbeat(time.Duration)          {}
+func (noopHealth) ReconcileDone(error)              {}
+func (noopHealth) SetTokenGrace(_, _ time.Duration) {}
+func (noopHealth) SetWatchGrace(time.Duration)      {}
+func (noopHealth) SetWatcherCheck(func() error)     {}
+func (noopHealth) WatchError(error)                 {}
+func (noopHealth) WatchHealthy()                    {}
+
 // Runner wires the ConfigMap informer to the reconciler. It reconciles on every
 // ConfigMap change and on a settings-driven resync interval, and serializes runs
 // so only one reconcile is in flight at a time.
@@ -23,6 +55,7 @@ type Runner struct {
 	ns   string
 	name string
 	key  string
+	h    Health
 	log  *zap.SugaredLogger
 
 	mu      sync.Mutex
@@ -33,14 +66,19 @@ type Runner struct {
 }
 
 // NewRunner builds a Runner for the ConfigMap ns/name and the data key holding
-// the spec.
-func NewRunner(rec *Reconciler, kc *k8s.Client, ns, name, key string) *Runner {
+// the spec. h, which may be nil, receives the loop's liveness heartbeats,
+// reconcile outcomes, and ConfigMap watcher state.
+func NewRunner(rec *Reconciler, kc *k8s.Client, ns, name, key string, h Health) *Runner {
+	if h == nil {
+		h = noopHealth{}
+	}
 	return &Runner{
 		rec:     rec,
 		kc:      kc,
 		ns:      ns,
 		name:    name,
 		key:     key,
+		h:       h,
 		log:     logging.Log().With("component", "runner"),
 		trigger: make(chan struct{}, 1),
 	}
@@ -49,47 +87,113 @@ func NewRunner(rec *Reconciler, kc *k8s.Client, ns, name, key string) *Runner {
 // Run starts the informer and the reconcile loop, blocking until ctx is cancelled.
 func (ru *Runner) Run(ctx context.Context) error {
 	handler := k8s.ConfigMapHandler{
+		// A delivered event — a real change or a relist — proves the watch is
+		// working, so it clears any recorded watch failure.
 		OnChange: func(cm *corev1.ConfigMap) {
+			ru.h.WatchHealthy()
 			ru.set(cm.Data[ru.key], true)
 			ru.notify()
 		},
 		OnDelete: func(_, _ string) {
+			ru.h.WatchHealthy()
 			ru.set("", false)
 			ru.notify()
 		},
+		OnWatchError: func(err error) { ru.h.WatchError(err) },
 	}
 	// resync=0: the informer only notifies on real changes; drift reconciles are
 	// driven by our own timer below, whose interval is a live ConfigMap setting.
-	if err := ru.kc.WatchConfigMap(ctx, ru.ns, ru.name, 0, handler); err != nil {
+	informer, err := ru.kc.WatchConfigMap(ctx, ru.ns, ru.name, 0, handler)
+	if err != nil {
 		return err
 	}
+	// A stopped informer never restarts itself, and the loop below would happily
+	// keep reconciling its stale cache, so this is a liveness failure.
+	ru.h.SetWatcherCheck(func() error {
+		if informer.IsStopped() {
+			return errors.New("configmap informer stopped")
+		}
+		return nil
+	})
 	ru.log.With("namespace", ru.ns, "name", ru.name).Info("watching configmap")
 
 	resync := config.DefaultResyncInterval
+	stall := config.DefaultStallTimeout
 	timer := time.NewTimer(resync)
 	defer timer.Stop()
 
+	// Liveness is a watchdog on this loop: before each wait and before each
+	// pass we declare when the next signal is due, so a loop wedged on a hung
+	// exec, fetch, or Vault call fails the probe instead of idling silently.
+	ru.h.Heartbeat(resync + stall)
+
+	// seen is the last spec whose changes were logged, so every ConfigMap edit
+	// is reported exactly once even though the loop is level-triggered.
+	var seen *config.Spec
+
 	for {
+		trigger := ""
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ru.trigger:
+			trigger = "configmap"
 		case <-timer.C:
+			trigger = "resync"
 		}
 
+		// A pass is starting: it gets stall to finish, not the idle budget.
+		ru.h.Heartbeat(stall)
+
+		// An absent, empty, or invalid ConfigMap is the user's spec being
+		// wrong, not the manager being wedged, so a skip still counts as a
+		// clean pass for readiness.
+		var err error
 		if spec, ok := ru.currentSpec(); ok {
-			if err := logging.SetLevel(spec.Settings.LogLevel); err != nil {
-				ru.log.With("error", err).Warn("invalid log level in settings")
+			if lvlErr := logging.SetLevel(spec.Settings.LogLevel); lvlErr != nil {
+				ru.log.With("error", lvlErr).Warn("invalid log level in settings")
 			}
-			if err := ru.rec.Reconcile(ctx, spec); err != nil {
+			ru.logChanges(seen, spec, trigger)
+			seen = spec
+			if err = ru.rec.Reconcile(ctx, spec); err != nil {
 				ru.log.With("error", err).Error("reconcile failed")
 			} else {
 				ru.log.Debug("reconcile complete")
 			}
 			resync = spec.Settings.ResyncInterval.Duration()
+			stall = spec.Settings.StallTimeout.Duration()
+			ru.h.SetTokenGrace(spec.Settings.TokenGracePeriod.Duration(), spec.Settings.TokenFailTimeout.Duration())
+			ru.h.SetWatchGrace(spec.Settings.WatchGracePeriod.Duration())
+		} else {
+			// Forget the spec so a ConfigMap that comes back is logged in full.
+			seen = nil
 		}
+		ru.h.ReconcileDone(err)
+		ru.h.Heartbeat(resync + stall)
 		resetTimer(timer, resync)
 	}
+}
+
+// logChanges reports what moved in the ConfigMap before the reconcile acts on
+// it: one line per change naming the section, the entry, and what differs. The
+// reconciler then logs the work itself (copied binary, registered version,
+// reconciled mount, pruned ...), so the two together read as intent followed by
+// action. A pass with nothing new logs only at debug.
+func (ru *Runner) logChanges(old, new *config.Spec, trigger string) {
+	changes := config.Diff(old, new)
+	if len(changes) == 0 {
+		ru.log.With("trigger", trigger).Debug("reconciling; no configmap changes")
+		return
+	}
+	for _, c := range changes {
+		ru.log.With(
+			"section", c.Section,
+			"key", c.Key,
+			"action", c.Action,
+			"detail", c.Detail,
+		).Info("configmap change: " + c.String())
+	}
+	ru.log.With("trigger", trigger, "changes", len(changes)).Info("reconciling configmap changes")
 }
 
 func (ru *Runner) set(raw string, present bool) {

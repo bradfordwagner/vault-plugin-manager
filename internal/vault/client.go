@@ -18,6 +18,22 @@ import (
 // DefaultServiceAccountTokenPath is where the projected SA token lives in-cluster.
 const DefaultServiceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
+// TokenObserver receives the state of the Vault token as the login/renew loop
+// learns it, so health probes can report on it. Implementations must be safe for
+// concurrent use; *health.State is one.
+type TokenObserver interface {
+	// TokenValid reports a successful login or renewal.
+	TokenValid()
+	// TokenInvalid reports a failed login or renewal.
+	TokenInvalid(err error)
+}
+
+// noopObserver is used when Config carries no TokenObserver.
+type noopObserver struct{}
+
+func (noopObserver) TokenValid()        {}
+func (noopObserver) TokenInvalid(error) {}
+
 // Config configures the Vault client and its Kubernetes-auth login.
 type Config struct {
 	Addr       string // Vault API address
@@ -26,6 +42,10 @@ type Config struct {
 	AuthMount  string // k8s auth mount path (default "kubernetes")
 	Role       string // Vault role bound to this ServiceAccount
 	TokenPath  string // SA token path (default DefaultServiceAccountTokenPath)
+
+	// TokenObserver, when set, is told every time the token becomes valid or
+	// fails to renew / re-login. Optional.
+	TokenObserver TokenObserver
 }
 
 // Client is a Vault API client that keeps its token authenticated via the
@@ -34,6 +54,7 @@ type Config struct {
 type Client struct {
 	api *api.Client
 	cfg Config
+	obs TokenObserver
 }
 
 // New builds a Vault API client from cfg. It does not log in; call Authenticate.
@@ -50,6 +71,10 @@ func New(cfg Config) (*Client, error) {
 	if cfg.TokenPath == "" {
 		cfg.TokenPath = DefaultServiceAccountTokenPath
 	}
+	obs := cfg.TokenObserver
+	if obs == nil {
+		obs = noopObserver{}
+	}
 
 	apiCfg := api.DefaultConfig()
 	apiCfg.Address = cfg.Addr
@@ -64,7 +89,7 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vault: creating client: %w", err)
 	}
-	return &Client{api: c, cfg: cfg}, nil
+	return &Client{api: c, cfg: cfg, obs: obs}, nil
 }
 
 // Initial-login retry bounds. During cluster ignition the Vault role that
@@ -104,11 +129,13 @@ func (c *Client) initialLogin(ctx context.Context) (*api.Secret, error) {
 	for {
 		secret, err := c.login(ctx)
 		if err == nil {
+			c.obs.TokenValid()
 			if retried {
 				l.Info("initial Vault login succeeded after retrying")
 			}
 			return secret, nil
 		}
+		c.obs.TokenInvalid(err)
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("vault: initial login failed after %s: %w", initialLoginBudget, err)
 		}
@@ -171,6 +198,7 @@ func (c *Client) maintain(ctx context.Context, secret *api.Secret) {
 
 		watcher, err := c.api.NewLifetimeWatcher(&api.LifetimeWatcherInput{Secret: secret})
 		if err != nil {
+			c.obs.TokenInvalid(err)
 			l.With("error", err).Warn("failed to start lifetime watcher; re-login")
 			secret = nil
 			if !sleepCtx(ctx, time.Second) {
@@ -204,6 +232,7 @@ func (c *Client) watch(ctx context.Context, w *api.LifetimeWatcher, l *zap.Sugar
 			return true
 		case renewal := <-w.RenewCh():
 			ttl := time.Duration(renewal.Secret.Auth.LeaseDuration) * time.Second
+			c.obs.TokenValid()
 			l.With("ttl", ttl.String()).Debug("token renewed")
 		}
 	}
@@ -215,8 +244,10 @@ func (c *Client) loginWithRetry(ctx context.Context, l *zap.SugaredLogger) (*api
 	for {
 		secret, err := c.login(ctx)
 		if err == nil {
+			c.obs.TokenValid()
 			return secret, nil
 		}
+		c.obs.TokenInvalid(err)
 		l.With("error", err).With("retry_in", backoff.String()).Warn("login failed; retrying")
 		if !sleepCtx(ctx, backoff) {
 			return nil, ctx.Err()
