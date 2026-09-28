@@ -30,7 +30,7 @@ helm lint ./chart
 helm template x ./chart --namespace vault   # render manifests
 
 # end-to-end: real Vault on a kind cluster (needs docker, kind, kubectl, helm)
-test/e2e/run.sh 1.20.4         # any hashicorp/vault tag; KEEP=1 leaves the cluster up
+test/e2e/run.sh 2.1.1          # any hashicorp/vault tag; KEEP=1 leaves the cluster up
 
 # container image (root Dockerfile; scratch/alpine variants)
 docker build --build-arg BASE_IMAGE=scratch     -t vpm:scratch .
@@ -39,7 +39,7 @@ docker build --build-arg BASE_IMAGE=alpine:3.22 -t vpm:alpine  .
 
 Task runner is [Task](https://taskfile.dev) (no Makefile): `task` (build),
 `task check` (build+vet+test), `task test`, `task lint`, `task watch` (watchexec
-dev loop), `task e2e -- 1.20.4`, `task image -- alpine:3.22`; `task --list` shows all.
+dev loop), `task e2e -- 2.1.1`, `task image -- alpine:3.22`; `task --list` shows all.
 The binary entrypoint is `./cmd/vault-plugin-manager` (subcommand: `serve`).
 Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
 

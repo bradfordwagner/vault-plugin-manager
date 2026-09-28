@@ -17,9 +17,9 @@ jobs:
       matrix:
         # Latest patch of the three most-recent community minor lines.
         vault:
-          - "1.20.4"
           - "1.21.4"
           - "2.0.4"
+          - "2.1.1"
     name: "vault ${{ matrix.vault }}"
     steps:
       - uses: actions/checkout@v4

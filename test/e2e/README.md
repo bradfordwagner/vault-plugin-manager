@@ -82,7 +82,7 @@ image rootfs by the OCI fetcher), so one sha256 covers both.
 Requires `docker`, `kind`, `kubectl`, `helm`.
 
 ```sh
-test/e2e/run.sh 1.18.5      # or any hashicorp/vault tag
+test/e2e/run.sh 2.1.1       # or any hashicorp/vault tag
 KEEP=1 test/e2e/run.sh      # leave the cluster up for inspection on exit
 ```
 
