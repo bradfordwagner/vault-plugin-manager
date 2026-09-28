@@ -21,3 +21,14 @@ probe is a watchdog on the reconcile loop (it fails if a pass stalls past
 settings.stallTimeout). Both endpoints return a JSON body explaining any failure:
   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "vault-plugin-manager.fullname" . }} -- wget -qO- localhost:{{ .Values.health.port }}/readyz
 {{- end }}
+{{- if .Values.metrics.enabled }}
+
+Prometheus metrics are served on the same port, at /metrics:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "vault-plugin-manager.fullname" . }} -- wget -qO- localhost:{{ .Values.health.port }}/metrics
+{{- if not .Values.metrics.service_monitor.enabled }}
+
+No ServiceMonitor was created. If you run the Prometheus Operator, set
+metrics.service_monitor.enabled=true (add metrics.service_monitor.labels to
+match your Prometheus instance's serviceMonitorSelector).
+{{- end }}
+{{- end }}

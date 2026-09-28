@@ -54,6 +54,32 @@ health:
     timeoutSeconds: 3
     failureThreshold: 3
 
+# Prometheus metrics. The manager serves /metrics on the SAME port as the health
+# probes, so there is no separate address or container port -- and metrics
+# require health.enabled. The endpoint is always served when that server runs;
+# the flags below only control whether anything can reach and scrape it.
+metrics:
+  # Renders a ClusterIP Service exposing the /metrics endpoint. Scraping by
+  # annotation-based Prometheus discovery needs only this.
+  enabled: true
+  service:
+    annotations: {}
+  service_monitor:
+    # Renders a monitoring.coreos.com/v1 ServiceMonitor. This requires the
+    # Prometheus Operator CRDs to be installed; the chart does NOT check for
+    # them, so the install fails loudly if they are absent. That is deliberate:
+    # a silently-missing ServiceMonitor means you asked for monitoring and got
+    # none, with no error to tell you.
+    enabled: false
+    interval: 30s
+    scrape_timeout: 10s
+    # Extra labels on the ServiceMonitor -- typically the label your Prometheus
+    # instance selects on (e.g. release: kube-prometheus-stack).
+    labels: {}
+    # Rendered verbatim into the scrape endpoint.
+    relabelings: []
+    metric_relabelings: []
+
 # OCI pulls: allow plain-HTTP / untrusted-TLS registries (e.g. an in-cluster
 # registry used for testing). Leave false in production.
 ociInsecure: false

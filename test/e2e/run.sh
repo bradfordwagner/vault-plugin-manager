@@ -226,6 +226,13 @@ MGR_IP="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=vault-plugin-manage
   --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')"
 retry 60 "liveness probe 200"  vexec "wget -qO- http://${MGR_IP}:8080/healthz"
 retry 60 "readiness probe 200" vexec "wget -qO- http://${MGR_IP}:8080/readyz"
+# /metrics rides the same listener; assert it is routed and carries our series.
+retry 60 "metrics endpoint serves vpm_ series" vexec \
+  "wget -qO- http://${MGR_IP}:8080/metrics | grep -q '^vpm_build_info'"
+# The Service is what a ServiceMonitor would select, so a wrong port or
+# targetPort only shows up by scraping through it rather than the pod IP.
+retry 60 "metrics Service routes to the endpoint" vexec \
+  "wget -qO- http://${MANAGER_DEPLOY}-metrics:8080/metrics | grep -q '^vpm_build_info'"
 
 # A restart (OOM, crash) would reset the manager's view of the ConfigMap and
 # silently invalidate the change-log assertion at the end of this run, so fail
@@ -264,5 +271,32 @@ echo "ok: OCI pruned, HTTP mount retained"
 assert_no_restarts "after prune"
 retry 60 "configmap change logged with the removed mount" bash -c \
   "kubectl -n $NS logs deploy/${MANAGER_DEPLOY} --tail=-1 | grep -q 'configmap change: mounts secret:e2e-oci removed'"
+
+##### 10. metrics reflect the work this run actually did #####
+# Instrumentation that compiles but is wired to the wrong branch reads zero
+# forever, and no unit test can tell the difference. This run copied binaries,
+# registered plugins, and pruned a mount, so those counters must be non-zero.
+log "Checking metrics recorded the reconcile work"
+# Sums every sample line containing the given FIXED string (HELP/TYPE comments
+# stripped first, so a bare metric name matches only real samples).
+metrics_value() {
+  vexec "wget -qO- http://${MGR_IP}:8080/metrics" \
+    | grep -v '^#' | grep -F -- "$1" \
+    | awk '{sum += $NF} END {printf "%d", sum+0}'
+}
+for series in \
+  'vpm_plugin_binary_copies_total{' \
+  'vpm_vault_actions_total{action="register",result="success"}' \
+  'vpm_vault_actions_total{action="unmount",result="success"}' \
+  'vpm_reconcile_total{result="success"'
+do
+  got="$(metrics_value "$series")"
+  [[ "$got" -gt 0 ]] || { echo "metric not recorded (still 0): $series"; exit 1; }
+  echo "ok: ${series} = ${got}"
+done
+# A skipped or failed pass must never stamp the freshness gauge.
+fresh="$(metrics_value 'vpm_last_successful_reconcile_timestamp_seconds')"
+[[ "$fresh" -gt 0 ]] || { echo "freshness gauge never stamped"; exit 1; }
+echo "ok: freshness gauge stamped"
 
 log "E2E PASSED for Vault ${VAULT_VERSION}"

@@ -45,4 +45,5 @@ jobs:
           build-args: |
             BUILDER_IMAGE=${{ env.builder_image }}
             BASE_IMAGE=${{ matrix.base.image }}
+            VERSION=${{ github.ref_name }}-${{ github.sha }}
           tags: ${{ env.image }}:ci-${{ matrix.base.suffix }}-${{ matrix.platform.arch }}

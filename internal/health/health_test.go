@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -360,4 +361,63 @@ func probeStatus(t *testing.T, url string) int {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode
+}
+
+// TokenHealthy and WatcherRunning back the Prometheus gauges. They report the
+// raw state, ungraced: the grace windows shape what the probes say, but a
+// metric wants the underlying fact so a dashboard can show a token flapping
+// inside its grace period.
+func TestMetricAccessorsReportUngracedState(t *testing.T) {
+	s, advance := newTestState(t)
+
+	if !s.TokenHealthy() {
+		t.Fatal("want a healthy token after a successful login")
+	}
+	s.TokenInvalid(errors.New("vault is sealed"))
+	if s.TokenHealthy() {
+		t.Error("want an unhealthy token immediately, without waiting out the grace")
+	}
+	// Still inside the grace window, so readiness holds while the gauge does not.
+	if !s.Ready() && s.ready {
+		t.Error("readiness should still be graced here; the accessor is the ungraced view")
+	}
+	s.TokenValid()
+	if !s.TokenHealthy() {
+		t.Error("want a healthy token again after the login recovers")
+	}
+	advance(time.Hour) // the token clock must not resurrect a valid token
+
+	// No check installed yet reads as running, matching snapshot's nil handling.
+	if !s.WatcherRunning() {
+		t.Error("want WatcherRunning true before a check is installed")
+	}
+	stopped := false
+	s.SetWatcherCheck(func() error {
+		if stopped {
+			return errors.New("configmap informer stopped")
+		}
+		return nil
+	})
+	if !s.WatcherRunning() {
+		t.Error("want WatcherRunning true while the check passes")
+	}
+	stopped = true
+	if s.WatcherRunning() {
+		t.Error("want WatcherRunning false once the informer has stopped")
+	}
+}
+
+// The metrics endpoint shares the probe server, so a request for it must be
+// routed rather than 404ed by the probe mux.
+func TestHandlerServesMetricsOnTheProbePort(t *testing.T) {
+	s, _ := newTestState(t)
+	rec := httptest.NewRecorder()
+	Handler(s).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, MetricsPath, nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 from %s, got %d", MetricsPath, rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "vpm_") {
+		t.Error("want vpm_ metrics in the body served on the probe port")
+	}
 }

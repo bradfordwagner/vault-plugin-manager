@@ -10,6 +10,7 @@ import (
 	"vault-plugin-manager/internal/config"
 	"vault-plugin-manager/internal/k8s"
 	"vault-plugin-manager/internal/logging"
+	"vault-plugin-manager/internal/metrics"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
@@ -137,9 +138,9 @@ func (ru *Runner) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ru.trigger:
-			trigger = "configmap"
+			trigger = metrics.TriggerConfigMap
 		case <-timer.C:
-			trigger = "resync"
+			trigger = metrics.TriggerResync
 		}
 
 		// A pass is starting: it gets stall to finish, not the idle budget.
@@ -149,15 +150,20 @@ func (ru *Runner) Run(ctx context.Context) error {
 		// wrong, not the manager being wedged, so a skip still counts as a
 		// clean pass for readiness.
 		var err error
+		started := time.Now()
+		result := metrics.ResultSkipped
 		if spec, ok := ru.currentSpec(); ok {
 			if lvlErr := logging.SetLevel(spec.Settings.LogLevel); lvlErr != nil {
 				ru.log.With("error", lvlErr).Warn("invalid log level in settings")
 			}
 			ru.logChanges(seen, spec, trigger)
 			seen = spec
+			metrics.SpecEntries(len(spec.Catalog), len(spec.Mounts), len(spec.Roles))
 			if err = ru.rec.Reconcile(ctx, spec); err != nil {
+				result = metrics.ResultError
 				ru.log.With("error", err).Error("reconcile failed")
 			} else {
+				result = metrics.ResultSuccess
 				ru.log.Debug("reconcile complete")
 			}
 			resync = spec.Settings.ResyncInterval.Duration()
@@ -168,6 +174,10 @@ func (ru *Runner) Run(ctx context.Context) error {
 			// Forget the spec so a ConfigMap that comes back is logged in full.
 			seen = nil
 		}
+		// A skipped pass is recorded but deliberately does not stamp the
+		// freshness gauge: an unparseable ConfigMap must not look like the
+		// manager is keeping Vault up to date.
+		metrics.ReconcileDone(trigger, result, time.Since(started))
 		ru.h.ReconcileDone(err)
 		ru.h.Heartbeat(resync + stall)
 		resetTimer(timer, resync)
@@ -186,6 +196,7 @@ func (ru *Runner) logChanges(old, new *config.Spec, trigger string) {
 		return
 	}
 	for _, c := range changes {
+		metrics.ConfigMapChange(c.Section, c.Action)
 		ru.log.With(
 			"section", c.Section,
 			"key", c.Key,

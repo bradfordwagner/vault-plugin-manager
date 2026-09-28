@@ -13,6 +13,7 @@ import (
 	"vault-plugin-manager/internal/health"
 	"vault-plugin-manager/internal/k8s"
 	"vault-plugin-manager/internal/logging"
+	"vault-plugin-manager/internal/metrics"
 	"vault-plugin-manager/internal/reconcile"
 	"vault-plugin-manager/internal/vault"
 )
@@ -49,6 +50,9 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 		TokenFailTimeout: config.DefaultTokenFailTimeout,
 		WatchGracePeriod: config.DefaultWatchGracePeriod,
 	})
+	// Vault token and watcher state are read from hs at scrape time rather than
+	// pushed, so the gauges cannot drift from the probes.
+	metrics.RegisterHealth(hs.TokenHealthy, hs.WatcherRunning)
 	if a.HealthAddr != "" {
 		stop, err := health.Serve(ctx, a.HealthAddr, hs)
 		if err != nil {
@@ -56,7 +60,7 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 		}
 		defer stop()
 	} else {
-		l.Warn("health_addr is empty; liveness/readiness probes are disabled")
+		l.Warn("health_addr is empty; liveness/readiness probes and the metrics endpoint are disabled")
 	}
 
 	// Vault client: authenticate now (retrying a not-yet-authorized role for a

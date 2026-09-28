@@ -60,9 +60,12 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
 - `internal/reconcile/` — the idempotent, level-triggered loop (`reconcile.go`)
   and the informer/timer `Runner` (`runner.go`).
 - `internal/health/` — liveness/readiness probe server (`health.go`): a watchdog
-  `State` the reconcile Runner heartbeats, served on `HEALTH_ADDR`.
+  `State` the reconcile Runner heartbeats, served on `HEALTH_ADDR`. Its mux also
+  mounts `/metrics`.
+- `internal/metrics/` — Prometheus collectors + handler (`metrics.go`).
 - `internal/logging/` — shared zap logger with a runtime-settable atomic level.
-- `chart/` — Helm chart (deployment, serviceaccount, RBAC, optional ConfigMap).
+- `chart/` — Helm chart (deployment, serviceaccount, RBAC, optional ConfigMap,
+  optional metrics Service + ServiceMonitor).
 - `Dockerfile` (root) — multi-stage: builds with the owned Go builder, slices the
   static binary into a `scratch` or `alpine` image.
 - `test/e2e/` — end-to-end harness (kind + real Vault matrix). `testplugin/` is a
@@ -86,6 +89,14 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   func — call `flag_helper.CreateFlag(...)` directly, don't alias it.
 - **Logging.** Use `internal/logging.Log()` (not `go-util/log`) so `logLevel`
   from settings applies at runtime via the atomic level.
+- **Metrics share the health port.** `/metrics` is mounted on the probe mux
+  (`health.Handler`), so there is no `METRICS_ADDR` and `HEALTH_ADDR=""` kills
+  both. Collectors are package-level on a private registry in `internal/metrics`
+  — deliberately NOT injected through an interface like `VaultOps`/`PodOps`,
+  which exist only so reconcile tests can run without a cluster. Token and
+  watcher gauges are `GaugeFunc` closures over `health.State` (pull, not push),
+  which is also what keeps `health` -> `metrics` from being an import cycle.
+  Tests assert DELTAS: the collectors are package-level and cannot be reset.
 - **Reconciler is testable.** It depends on narrow `VaultOps` / `PodOps`
   interfaces (satisfied by the real clients) and the `fetch.Fetcher` interface,
   so `reconcile_test.go` drives it with fakes — no cluster or Vault required.
