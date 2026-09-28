@@ -52,5 +52,7 @@ tasks:
     desc: 'Build the container image. Usage: task image -- scratch | task image -- alpine:3.22'
     vars:
       BASE: '{{.CLI_ARGS | default "scratch"}}'
+      VERSION:
+        sh: git describe --tags --always --dirty 2>/dev/null || echo dev
     cmds:
-      - docker build --build-arg BASE_IMAGE={{.BASE}} -t vault-plugin-manager:local .
+      - docker build --build-arg BASE_IMAGE={{.BASE}} --build-arg VERSION={{.VERSION}} -t vault-plugin-manager:local .

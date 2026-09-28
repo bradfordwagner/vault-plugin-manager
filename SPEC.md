@@ -175,6 +175,27 @@ each reconcile so they change without a redeploy:
 - The server starts before the Vault login so the bounded ignition retry (3m)
   reports live-but-not-ready instead of an unanswered port.
 
+**Metrics** (`internal/metrics`, served at `/metrics` on `health_addr`):
+
+- Shares the probe server. The manager runs one HTTP listener, so metrics need
+  no address, port, flag, or env var of their own — and `health_addr=""`
+  disables them along with the probes.
+- Collectors are package-level on a private registry, not injected through an
+  interface. The reconciler's `VaultOps`/`PodOps` interfaces exist so tests can
+  run without a cluster; metrics need no such escape hatch.
+- Vault token and ConfigMap watcher state are read from `health.State` at scrape
+  time (`GaugeFunc`), not pushed, so the gauges cannot drift from the probes.
+  `metrics.RegisterHealth` takes closures rather than a `*health.State`, which
+  is what lets `health` import `metrics` without a cycle.
+- `result="skipped"` is a distinct bucket from `error`, and a skipped pass does
+  not stamp `last_successful_reconcile_timestamp_seconds` — a ConfigMap that has
+  been broken for an hour must not look like a healthy manager.
+- The alerting label combinations are pre-seeded at zero so a new pod reads as
+  zero errors rather than no data. No metric is labelled by pod name (unbounded
+  cardinality, worthless history).
+- Steady-state `vault_actions_total` should be flat; a persistent rate is the
+  signature of the idempotency bug class described in the version-prefix note.
+
 Command shape: `vault-plugin-manager serve` (long-running). A `reconcile` one-shot
 subcommand is a nice-to-have for CI/debugging.
 
@@ -246,12 +267,20 @@ Templates:
 - `serviceaccount.yaml`
 - `rbac.yaml` — Role + RoleBinding (namespaced).
 - `configmap.yaml` — optional example/default plugins ConfigMap (toggle in values).
+- `service.yaml` — ClusterIP exposing `/metrics` (toggle `metrics.enabled`); it
+  exists only for scraping, since probes are called on the pod directly.
+- `servicemonitor.yaml` — `monitoring.coreos.com/v1` ServiceMonitor (toggle
+  `metrics.service_monitor.enabled`, default off). No CRD capability guard: a
+  missing operator fails the install loudly rather than installing nothing.
 - `_helpers.tpl`, `Chart.yaml`, `values.yaml`.
 
 Key `values.yaml`: image repo/tag, `vault.addr`, `vault.authRole`, `vault.authMount`,
 `vault.podSelector`, `plugin.dir`, `resyncInterval`, `pruneMode`, `configMap.name`,
-resources, TLS settings, and `health` (`enabled`, `port`, and the `livenessProbe`
-/ `readinessProbe` maps, rendered verbatim so any probe field can be overridden).
+resources, TLS settings, `health` (`enabled`, `port`, and the `livenessProbe`
+/ `readinessProbe` maps, rendered verbatim so any probe field can be overridden),
+and `metrics` (`enabled`, plus a `service_monitor` block). The `metrics` keys are
+snake_case while the rest of the file is camelCase — deliberate, since converting
+the existing keys would break every current override.
 
 ---
 
@@ -266,7 +295,8 @@ internal/vault/                  # k8s-auth client, catalog, mounts, reload
 internal/k8s/                    # pod discovery + exec-copy
 internal/fetch/                  # PluginFetcher interface + http + oci impls
 internal/reconcile/             # the reconcile loop
-internal/health/                 # liveness/readiness probe server
+internal/health/                 # liveness/readiness probe server (also mounts /metrics)
+internal/metrics/                # Prometheus collectors + handler
 chart/                           # Helm chart
 ```
 

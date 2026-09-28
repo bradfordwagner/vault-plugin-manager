@@ -32,6 +32,13 @@ resources:
 # Pull the test plugin image from the in-cluster registry over plain HTTP.
 ociInsecure: true
 
+# The metrics Service is exercised by the run; the ServiceMonitor is not, since
+# the kind cluster has no Prometheus Operator CRDs to accept the CR.
+metrics:
+  enabled: true
+  service_monitor:
+    enabled: false
+
 configMap:
   create: false
   name: vault-plugins

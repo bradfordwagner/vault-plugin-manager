@@ -39,12 +39,16 @@ import (
 	"time"
 
 	"vault-plugin-manager/internal/logging"
+	"vault-plugin-manager/internal/metrics"
 )
 
 // Paths served by Handler. They match the chart's default probe paths.
 const (
 	LivenessPath  = "/healthz"
 	ReadinessPath = "/readyz"
+	// MetricsPath shares this server because the manager already runs one HTTP
+	// listener for the probes and metrics need no separate lifecycle.
+	MetricsPath = "/metrics"
 )
 
 // DefaultAddr is the default listen address for the probe server.
@@ -299,6 +303,27 @@ func (s *State) Live() bool { return s.snapshot().Live }
 // not been failing past WatchGracePeriod.
 func (s *State) Ready() bool { return s.snapshot().Ready }
 
+// TokenHealthy reports whether the Vault token is currently valid. It is the
+// raw flag, ungraced — the grace windows are a probe concern, and a metric
+// wants the underlying state. Named apart from TokenValid, which is the
+// observer callback that records a successful login.
+func (s *State) TokenHealthy() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tokenValid
+}
+
+// WatcherRunning reports whether the ConfigMap informer is still running. A
+// State with no watcher check installed yet counts as running, matching
+// snapshot's treatment of a nil check.
+func (s *State) WatcherRunning() bool {
+	// Interrogate outside the lock: watcherCheck takes another package's mutex.
+	s.mu.Lock()
+	check := s.watcherCheck
+	s.mu.Unlock()
+	return check == nil || check() == nil
+}
+
 // Handler serves the liveness and readiness endpoints for s. Both return the
 // same JSON body, with 200 when the probed condition holds and 503 when it does
 // not.
@@ -306,6 +331,7 @@ func Handler(s *State) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle(LivenessPath, probe(s, func(r report) bool { return r.Live }))
 	mux.Handle(ReadinessPath, probe(s, func(r report) bool { return r.Ready }))
+	mux.Handle(MetricsPath, metrics.Handler())
 	return mux
 }
 

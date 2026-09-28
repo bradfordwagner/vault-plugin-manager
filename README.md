@@ -45,7 +45,7 @@ Configuration is split in two:
 | `VAULT_NAMESPACE` | own namespace | where Vault pods run |
 | `VAULT_CONTAINER` | `vault` | container to exec into |
 | `PLUGIN_DIR` | `/vault/plugins` | Vault `plugin_directory` |
-| `HEALTH_ADDR` | `:8080` | liveness/readiness listen address; empty disables |
+| `HEALTH_ADDR` | `:8080` | liveness/readiness **and `/metrics`** listen address; empty disables |
 
 ### Runtime tunables (ConfigMap `settings:`)
 
@@ -200,6 +200,64 @@ $ kubectl exec -it deploy/vault-plugin-manager -- wget -qO- localhost:8080/ready
  "tokenValid":false,"tokenInvalidFor":"4m2s","tokenError":"vault: kubernetes login: connection refused","watcherRunning":true}
 ```
 
+## Metrics
+
+Prometheus metrics are served at **`/metrics` on the health port** — the manager
+runs one HTTP listener, so there is no separate address or container port, and
+`HEALTH_ADDR=""` disables metrics along with the probes. Nothing else is needed
+server-side: no flag, no env var. Scraping needs **no Vault ACL and no extra
+Kubernetes RBAC** — the endpoint reads only in-process state.
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `vpm_plugin_binary_copies_total` | counter | `plugin`, `version` |
+| `vpm_reconcile_total` | counter | `trigger` (`configmap`/`resync`), `result` (`success`/`error`/`skipped`) |
+| `vpm_configmap_changes_total` | counter | `section`, `action` (the same keys the change log uses) |
+| `vpm_vault_actions_total` | counter | `action`, `result` |
+| `vpm_reconcile_duration_seconds` | histogram | — |
+| `vpm_last_successful_reconcile_timestamp_seconds` | gauge | — |
+| `vpm_spec_entries` | gauge | `kind` (`catalog`/`mounts`/`roles`) |
+| `vpm_vault_token_valid` | gauge | — |
+| `vpm_configmap_watcher_running` | gauge | — |
+| `vpm_build_info` | gauge | `version` |
+
+Plus the standard Go runtime and process collectors.
+
+`result="skipped"` is its own bucket, not an error: an absent or unparseable
+ConfigMap is the user's spec being wrong, not the manager being broken. A skipped
+pass deliberately does **not** stamp
+`vpm_last_successful_reconcile_timestamp_seconds`, so a ConfigMap that has been
+broken for an hour cannot look like a manager that is keeping Vault up to date.
+
+No metric carries a pod name: pod names change on every restart, so a
+pod-labelled series grows without bound and its history is worthless. That is why
+`vpm_plugin_binary_copies_total` counts placements without saying where.
+
+The alerting counters are pre-seeded at zero, so a healthy new pod reads as *zero
+errors* rather than *no data*.
+
+### Alerts worth having
+
+```yaml
+# The single best signal: covers a wedged loop, a crashloop, and a scrape gap.
+- alert: VaultPluginManagerStale
+  expr: time() - vpm_last_successful_reconcile_timestamp_seconds > 900
+  for: 5m
+
+# Reconciles are running but failing.
+- alert: VaultPluginManagerReconcileErrors
+  expr: rate(vpm_reconcile_total{result="error"}[15m]) > 0
+  for: 15m
+
+# Steady-state churn. The loop is level-triggered and idempotent, so these
+# counters should be FLAT once things have converged. A persistent rate means an
+# idempotency check is missing its match and mounts are flapping -- exactly the
+# failure mode of the Vault version-prefix bug described in CLAUDE.md.
+- alert: VaultPluginManagerChurn
+  expr: rate(vpm_vault_actions_total{action=~"register|reload|mount"}[30m]) > 0
+  for: 30m
+```
+
 ## Change logging
 
 Every reconcile logs **what changed in the ConfigMap** before the reconciler logs
@@ -350,3 +408,37 @@ helm upgrade vault-plugin-manager ./chart \
 
 `health.enabled=false` drops both probes, the container port, and the probe
 server itself (`HEALTH_ADDR=""`).
+
+### Metrics and the ServiceMonitor
+
+`metrics.enabled` (default `true`) renders a ClusterIP Service exposing
+`/metrics`. It does not control the endpoint itself — that is always served when
+the health server runs — only whether anything can reach it.
+
+```sh
+helm upgrade vault-plugin-manager ./chart \
+  --set metrics.service_monitor.enabled=true \
+  --set metrics.service_monitor.labels.release=kube-prometheus-stack
+```
+
+| Value | Default | Purpose |
+|-------|---------|---------|
+| `metrics.enabled` | `true` | render the metrics Service |
+| `metrics.service.annotations` | `{}` | e.g. annotation-based scrape discovery |
+| `metrics.service_monitor.enabled` | `false` | render a `monitoring.coreos.com/v1` ServiceMonitor |
+| `metrics.service_monitor.interval` | `30s` | scrape interval |
+| `metrics.service_monitor.scrape_timeout` | `10s` | scrape timeout |
+| `metrics.service_monitor.labels` | `{}` | labels your Prometheus `serviceMonitorSelector` matches |
+| `metrics.service_monitor.relabelings` / `.metric_relabelings` | `[]` | rendered verbatim into the endpoint |
+
+These keys are `snake_case` while the rest of `values.yaml` is `camelCase`. That
+is deliberate — converting the existing keys would break every current override.
+The *rendered* ServiceMonitor fields stay camelCase (`scrapeTimeout`,
+`metricRelabelings`) because those are Kubernetes API field names.
+
+The chart does **not** check for the Prometheus Operator CRDs. If they are
+absent the install fails with `no matches for kind "ServiceMonitor"`, which beats
+silently installing no monitoring at all. It *does* fail the render, with an
+explanatory message, if you enable the ServiceMonitor without `metrics.enabled`
+or `health.enabled` — a ServiceMonitor whose selector matches nothing produces no
+error and no metrics.

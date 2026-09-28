@@ -13,6 +13,7 @@ import (
 	"vault-plugin-manager/internal/config"
 	"vault-plugin-manager/internal/fetch"
 	"vault-plugin-manager/internal/logging"
+	"vault-plugin-manager/internal/metrics"
 	"vault-plugin-manager/internal/vault"
 
 	"go.uber.org/zap"
@@ -101,6 +102,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 				return fmt.Errorf("reconcile: placing %s on pod %s: %w", fileName, pod, err)
 			}
 			if copied {
+				metrics.PluginCopied(c.Name, c.Version)
 				r.log.With("plugin", c.Name, "version", c.Version, "pod", pod).Info("copied plugin binary")
 			}
 		}
@@ -112,6 +114,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 			Command: fileName,
 			SHA256:  res.SHA256,
 		})
+		metrics.VaultAction(metrics.ActionRegister, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: registering %s@%s: %w", c.Name, c.Version, err)
 		}
@@ -139,6 +142,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 			Description: m.Config.Description,
 			Options:     m.Config.Options,
 		})
+		metrics.VaultAction(metrics.ActionMount, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: mount %s: %w", m.Path, err)
 		}
@@ -150,7 +154,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 
 	// 3. Reload plugins that changed.
 	for name := range reload {
-		if err := r.vault.ReloadPlugin(ctx, name); err != nil {
+		err := r.vault.ReloadPlugin(ctx, name)
+		metrics.VaultAction(metrics.ActionReload, err)
+		if err != nil {
 			return fmt.Errorf("reconcile: reloading %s: %w", name, err)
 		}
 		r.log.With("plugin", name).Info("reloaded plugin")
@@ -188,12 +194,14 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 	desiredRoles := make(map[string]map[string]map[string]bool)
 	for _, role := range spec.Roles {
 		mount := strings.Trim(role.Mount, "/")
-		if err := r.vault.EnsureRole(ctx, vault.Role{
+		err := r.vault.EnsureRole(ctx, vault.Role{
 			Mount:     role.Mount,
 			RolesPath: role.RolesPath,
 			Name:      role.Name,
 			Data:      role.Data,
-		}); err != nil {
+		})
+		metrics.VaultAction(metrics.ActionRoleUpsert, err)
+		if err != nil {
 			return fmt.Errorf("reconcile: role %s/%s/%s: %w", mount, role.RolesPath, role.Name, err)
 		}
 		r.log.With("mount", mount, "rolesPath", role.RolesPath, "role", role.Name).Debug("ensured role")
@@ -227,7 +235,9 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 				if desired[name] {
 					continue
 				}
-				if err := r.vault.DeleteRole(ctx, mount, rolesPath, name); err != nil {
+				err := r.vault.DeleteRole(ctx, mount, rolesPath, name)
+				metrics.VaultAction(metrics.ActionRoleDelete, err)
+				if err != nil {
 					return fmt.Errorf("reconcile: pruning role %s/%s/%s: %w", mount, rolesPath, name, err)
 				}
 				r.log.With("mount", mount, "rolesPath", rolesPath, "role", name).Info("pruned role")
@@ -253,7 +263,9 @@ func (r *Reconciler) prune(ctx context.Context, mode config.PruneMode, pods []st
 			continue
 		}
 
-		if err := r.vault.DisableMount(ctx, mm.Path, mm.Type); err != nil {
+		err := r.vault.DisableMount(ctx, mm.Path, mm.Type)
+		metrics.VaultAction(metrics.ActionUnmount, err)
+		if err != nil {
 			return err
 		}
 		r.log.With("mount", mm.Path, "mode", string(mode)).Info("pruned mount")
@@ -263,7 +275,9 @@ func (r *Reconciler) prune(ctx context.Context, mode config.PruneMode, pods []st
 		if mm.Version == "" || desiredVersions[nvKey(mm.Plugin, mm.Version)] {
 			continue
 		}
-		if err := r.vault.DeregisterPlugin(ctx, mm.Plugin, mm.Type, mm.Version); err != nil {
+		err = r.vault.DeregisterPlugin(ctx, mm.Plugin, mm.Type, mm.Version)
+		metrics.VaultAction(metrics.ActionDeregister, err)
+		if err != nil {
 			return err
 		}
 		r.log.With("plugin", mm.Plugin, "version", mm.Version).Info("deregistered plugin version")

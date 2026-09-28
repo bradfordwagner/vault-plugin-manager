@@ -1,0 +1,43 @@
+{{- if .Values.metrics.service_monitor.enabled }}
+{{- /*
+  A ServiceMonitor whose selector matches nothing produces no error and no
+  metrics -- the quiet failure worth guarding. Fail the render instead.
+*/}}
+{{- if not .Values.metrics.enabled }}
+{{- fail "metrics.service_monitor.enabled requires metrics.enabled (the ServiceMonitor selects the metrics Service)" }}
+{{- end }}
+{{- if not .Values.health.enabled }}
+{{- fail "metrics.service_monitor.enabled requires health.enabled (/metrics is served on the health port)" }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "vault-plugin-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vault-plugin-manager.labels" . | nindent 4 }}
+    {{- with .Values.metrics.service_monitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "vault-plugin-manager.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http
+      interval: {{ .Values.metrics.service_monitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.service_monitor.scrape_timeout }}
+      {{- with .Values.metrics.service_monitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metrics.service_monitor.metric_relabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

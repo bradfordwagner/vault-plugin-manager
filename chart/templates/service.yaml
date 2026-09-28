@@ -1,0 +1,29 @@
+{{- if and .Values.metrics.enabled .Values.health.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vault-plugin-manager.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vault-plugin-manager.labels" . | nindent 4 }}
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    # targetPort names the container port the Deployment declares, so the two
+    # cannot drift if health.port changes.
+    - name: metrics
+      port: {{ .Values.health.port }}
+      targetPort: health
+      protocol: TCP
+  selector:
+    {{- include "vault-plugin-manager.selectorLabels" . | nindent 4 }}
+{{- end }}
+{{- /*
+  This Service exists ONLY so metrics can be scraped. The manager serves no
+  traffic: /metrics, /healthz, and /readyz are the whole surface, and the
+  probes are called by the kubelet on the pod directly, not through here.
+*/ -}}

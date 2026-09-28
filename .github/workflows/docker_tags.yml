@@ -42,6 +42,7 @@ jobs:
           build-args: |
             BUILDER_IMAGE=${{ env.builder_image }}
             BASE_IMAGE=${{ matrix.base.image }}
+            VERSION=${{ github.ref_name }}
           outputs: type=image,name=${{ env.image }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         run: |
