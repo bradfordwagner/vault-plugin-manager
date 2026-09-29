@@ -57,14 +57,15 @@ type Client struct {
 	cfg Config
 	obs TokenObserver
 
-	// roleKeys and mountOptions remember what this process last DECLARED, per
-	// role path and per mount, so EnsureRole and EnsureMount can tell "the spec
-	// dropped this key" (which must be written) from "the spec never declared it"
-	// (a plugin or Vault default, which must be left alone). Reconciles are
-	// serial today, but the mutex keeps that from being load-bearing.
-	stateMu      sync.Mutex
-	roleKeys     map[string]string
-	mountOptions map[string]mountMemory
+	// roleKeys remembers, per role path, the key set this process last wrote, so
+	// EnsureRole can tell "the spec dropped this key" (which must be written)
+	// from "the spec never declared it" (a plugin default, which must be left
+	// alone). A role body carries the plugin's defaults for everything it omits,
+	// so unlike mount options its desired state cannot be read off the spec
+	// alone. Reconciles are serial today, but the mutex keeps that from being
+	// load-bearing.
+	stateMu  sync.Mutex
+	roleKeys map[string]string
 }
 
 // New builds a Vault API client from cfg. It does not log in; call Authenticate.

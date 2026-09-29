@@ -116,28 +116,27 @@ func TestMountTune(t *testing.T) {
 		}
 		return out
 	}
-	// seen models a mount this process has already written, which is the state
-	// every pass after the first is in.
-	seen := func(keys ...string) mountMemory {
-		mem := mountMemory{seen: true, optionsKeys: map[string]bool{}}
-		for _, k := range keys {
-			mem.optionsKeys[k] = true
-		}
-		return mem
-	}
 
 	t.Run("converged mount does not tune", func(t *testing.T) {
 		m := Mount{Version: "1.0.0", Description: "github creds", Options: map[string]string{"a": "1"}}
 		live := liveMount{Version: "v1.0.0", Description: "github creds", Options: managedOpts(map[string]string{"a": "1"})}
-		if _, res := mountTune(live, m, seen("a")); res.Changed {
+		if _, res := mountTune(live, m); res.Changed {
 			t.Error("an unchanged mount must not be tuned")
+		}
+	})
+
+	t.Run("a mount with no declared config stays quiet", func(t *testing.T) {
+		m := Mount{Version: "1.0.0"}
+		live := liveMount{Version: "v1.0.0", Options: managedOpts(nil)}
+		if _, res := mountTune(live, m); res.Changed {
+			t.Error("a mount declaring no description or options must not be tuned")
 		}
 	})
 
 	t.Run("version bump reloads", func(t *testing.T) {
 		m := Mount{Version: "1.1.0"}
 		live := liveMount{Version: "v1.0.0", Options: managedOpts(nil)}
-		tune, res := mountTune(live, m, seen())
+		tune, res := mountTune(live, m)
 		if !res.Changed || tune.PluginVersion == nil || *tune.PluginVersion != "1.1.0" {
 			t.Errorf("want a version tune, got %+v / %+v", res, tune)
 		}
@@ -147,11 +146,11 @@ func TestMountTune(t *testing.T) {
 	})
 
 	// A reload tears down and re-initializes the backend on every HA node, so a
-	// cosmetic edit must not cause one.
+	// metadata edit must not cause one.
 	t.Run("description edit does not reload", func(t *testing.T) {
 		m := Mount{Version: "1.0.0", Description: "new words"}
 		live := liveMount{Version: "v1.0.0", Description: "old words", Options: managedOpts(nil)}
-		tune, res := mountTune(live, m, seen())
+		tune, res := mountTune(live, m)
 		if !res.Changed || tune.Description == nil || *tune.Description != "new words" {
 			t.Errorf("want a description tune, got %+v / %+v", res, tune)
 		}
@@ -163,31 +162,31 @@ func TestMountTune(t *testing.T) {
 		}
 	})
 
-	t.Run("options edit keeps what Vault maintains", func(t *testing.T) {
-		m := Mount{Version: "1.0.0", Options: map[string]string{"a": "2"}}
-		live := liveMount{Version: "v1.0.0", Options: managedOpts(map[string]string{"a": "1", "vault_owned": "keep"})}
-		tune, res := mountTune(live, m, seen("a"))
+	// Options DO need a reload: Vault hands them to the backend as its config at
+	// initialization, so a tune alone persists them without putting them in
+	// effect.
+	t.Run("options edit reloads", func(t *testing.T) {
+		m := Mount{Version: "1.0.0", Options: map[string]string{"tier": "silver"}}
+		live := liveMount{Version: "v1.0.0", Options: managedOpts(map[string]string{"tier": "gold"})}
+		tune, res := mountTune(live, m)
 		if !res.Changed || tune.Options == nil {
 			t.Fatalf("want an options tune, got %+v / %+v", res, tune)
 		}
-		got := *tune.Options
-		if got["a"] != "2" {
-			t.Errorf("declared option not applied: %v", got)
+		if (*tune.Options)["tier"] != "silver" || !isManaged(*tune.Options) {
+			t.Errorf("tuned options wrong: %v", *tune.Options)
 		}
-		if got["vault_owned"] != "keep" {
-			t.Errorf("a tune must not drop options it did not declare: %v", got)
-		}
-		if !isManaged(got) {
-			t.Errorf("a tune must not drop the ownership marker: %v", got)
+		if !res.Reload {
+			t.Error("an options edit must reload: the backend read them at init")
 		}
 	})
 
-	// An option that LEAVES the spec must be removed. Comparing declared keys
-	// alone can never see this: the keys that remain still match.
+	// An option that LEAVES the spec must be removed. The desired set is read off
+	// the spec, not off a memory of what this process wrote, so this converges
+	// even when the edit happened while the manager was down.
 	t.Run("removed option is dropped", func(t *testing.T) {
 		m := Mount{Version: "1.0.0", Options: map[string]string{"a": "1"}}
 		live := liveMount{Version: "v1.0.0", Options: managedOpts(map[string]string{"a": "1", "tier": "gold"})}
-		tune, res := mountTune(live, m, seen("a", "tier"))
+		tune, res := mountTune(live, m)
 		if !res.Changed || tune.Options == nil {
 			t.Fatalf("want an options tune, got %+v / %+v", res, tune)
 		}
@@ -197,26 +196,22 @@ func TestMountTune(t *testing.T) {
 		if (*tune.Options)["a"] != "1" || !isManaged(*tune.Options) {
 			t.Errorf("removal dropped more than it should: %v", *tune.Options)
 		}
-		if res.Reload {
-			t.Error("an options edit must not reload the plugin")
-		}
 	})
 
-	// First sighting reasserts the declared state once, which is what applies an
-	// edit made while the manager was down.
-	t.Run("first sighting reasserts", func(t *testing.T) {
-		m := Mount{Version: "1.0.0", Description: "github creds", Options: map[string]string{"a": "1"}}
-		live := liveMount{Version: "v1.0.0", Description: "github creds", Options: managedOpts(map[string]string{"a": "1"})}
-		_, res := mountTune(live, m, mountMemory{})
-		if !res.Changed {
-			t.Error("the first sighting of a mount in a process must reassert its declared state")
+	// The same removal, seen by a process that never wrote this mount: a restart
+	// must not resurrect the option a memory-based approach would have lost.
+	t.Run("removed option is dropped after a restart", func(t *testing.T) {
+		m := Mount{Version: "1.0.0"}
+		live := liveMount{Version: "v1.0.0", Options: managedOpts(map[string]string{"tier": "gold"})}
+		tune, res := mountTune(live, m)
+		if !res.Changed || tune.Options == nil {
+			t.Fatalf("want an options tune, got %+v / %+v", res, tune)
 		}
-		if res.Reload {
-			t.Error("reasserting must not reload the plugin")
+		if _, still := (*tune.Options)["tier"]; still {
+			t.Errorf("a fresh process wrote the stale option back: %v", *tune.Options)
 		}
-		// ...and it goes quiet once recorded.
-		if _, res := mountTune(live, m, seen("a")); res.Changed {
-			t.Error("the reassert must not repeat on later passes")
+		if !isManaged(*tune.Options) {
+			t.Errorf("the ownership marker must survive: %v", *tune.Options)
 		}
 	})
 
@@ -226,7 +221,7 @@ func TestMountTune(t *testing.T) {
 	t.Run("a foreign mount keeps its description and options", func(t *testing.T) {
 		m := Mount{Version: "1.1.0", Description: "ours", Options: map[string]string{"a": "2"}}
 		live := liveMount{Version: "v1.0.0", Description: "theirs", Options: map[string]string{"a": "1"}}
-		tune, res := mountTune(live, m, mountMemory{})
+		tune, res := mountTune(live, m)
 		if !res.Changed || tune.PluginVersion == nil {
 			t.Fatalf("want the version pinned, got %+v / %+v", res, tune)
 		}

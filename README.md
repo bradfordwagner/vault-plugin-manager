@@ -135,12 +135,14 @@ verbatim to the plugin, which owns the schema — vpm only owns *placement*.
   manager was down. List values compare as sets — a plugin that reorders them is
   not treated as drift, so a pure reorder of a list is not detected.
 - Mount `config.description` and `config.options` are reconciled on every pass,
-  not just at creation: editing either is applied by a tune. Only options the
-  spec declares are touched (options Vault maintains itself are left alone), and
-  an option removed from the spec is removed from the mount. A **description or
-  options edit does not reload the plugin** — only a version move does, since a
-  reload re-initializes the backend on every HA node. Mounts this manager did not
-  create keep their own description and options; only their version is pinned.
+  not just at creation: editing either is applied by a tune, and an option removed
+  from the spec is removed from the mount (on a managed mount the declared options
+  are the whole truth). A **version or options change reloads the plugin** —
+  Vault hands a mount's options to the backend at initialization, so without a
+  reload they would be stored but not in effect — while a **description edit does
+  not**, since a reload re-initializes the backend on every HA node. Mounts this
+  manager did not create keep their own description and options; only their
+  version is pinned.
 - Under `pruneMode: full`, a role under a *declared* `rolesPath` on a managed mount
   that is not listed here is deleted. **Limitation:** a `rolesPath` the ConfigMap
   never declares is never enumerated, so its stale roles are not pruned — vpm stays
@@ -156,7 +158,7 @@ by request handling. Two endpoints on `HEALTH_ADDR` (`:8080` by default) answer
 | Endpoint | Probe | Semantics |
 |----------|-------|-----------|
 | `/healthz` | liveness | A **watchdog on the reconcile loop**, plus the Vault token and the ConfigMap watcher. Before each wait the loop declares when its next signal is due (`resyncInterval + stallTimeout` while idle, `stallTimeout` while a pass runs). A loop stuck on a hung exec, fetch, or Vault call misses that deadline. It also fails once the Vault token has been invalid for `tokenFailTimeout`, or the ConfigMap informer has stopped. |
-| `/readyz` | readiness | A **startup gate**, plus the Vault token and the ConfigMap watch. It flips true on the first clean reconcile pass, so `helm --wait` / `kubectl rollout status` gates on the manager actually reconciling. It drops again while the Vault token has been invalid for longer than `tokenGracePeriod`, or the watch has been failing for longer than `watchGracePeriod`. Reconcile errors appear in the body's `lastError` but do not unready the pod, so a transient error doesn't flap the rollout. |
+| `/readyz` | readiness | A **startup gate**, plus the Vault token and the ConfigMap watch. It flips true on the first clean reconcile pass, so `helm --wait` / `kubectl rollout status` gates on the manager actually reconciling — a pass skipped because the ConfigMap is absent or invalid does not count, since nothing was reconciled. It drops again while the Vault token has been invalid for longer than `tokenGracePeriod`, or the watch has been failing for longer than `watchGracePeriod`. Reconcile errors appear in the body's `lastError` but do not unready the pod, so a transient error doesn't flap the rollout. |
 
 ### Vault token health
 
@@ -180,9 +182,11 @@ unready. An **unset** `tokenFailTimeout` tracks the grace automatically (it is
 `max(15m, tokenGracePeriod)`), so raising `tokenGracePeriod` on its own is safe.
 Setting both, inverted, is still rejected — and note what a rejected spec costs:
 the WHOLE ConfigMap is invalid, so the manager stops reconciling catalog, mounts
-and roles, while both probes stay green (a skipped pass counts as clean). Watch
+and roles. A manager that was already working stays Ready (a skipped pass must
+not tear it out of service), so watch
 `vpm_last_successful_reconcile_timestamp_seconds` and the `invalid configmap
-spec` error log.
+spec` error log — though a pod that has NEVER parsed its ConfigMap never goes
+Ready at all, so a fresh rollout fails visibly.
 
 ### ConfigMap watcher health
 

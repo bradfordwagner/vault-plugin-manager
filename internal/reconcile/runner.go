@@ -23,6 +23,9 @@ type Health interface {
 	Heartbeat(d time.Duration)
 	// ReconcileDone reports the outcome of one pass; nil means a clean pass.
 	ReconcileDone(err error)
+	// ReconcileSkipped reports a pass declined because the ConfigMap was absent,
+	// empty, or unparseable: clean, but no proof that anything reconciled.
+	ReconcileSkipped()
 	// SetTokenGrace applies the ConfigMap's Vault-token health windows.
 	SetTokenGrace(grace, failAfter time.Duration)
 	// SetWatchGrace applies the ConfigMap's watch-error window.
@@ -41,6 +44,7 @@ type noopHealth struct{}
 
 func (noopHealth) Heartbeat(time.Duration)          {}
 func (noopHealth) ReconcileDone(error)              {}
+func (noopHealth) ReconcileSkipped()                {}
 func (noopHealth) SetTokenGrace(_, _ time.Duration) {}
 func (noopHealth) SetWatchGrace(time.Duration)      {}
 func (noopHealth) SetWatcherCheck(func() error)     {}
@@ -187,7 +191,13 @@ func (ru *Runner) Run(ctx context.Context) error {
 		// freshness gauge: an unparseable ConfigMap must not look like the
 		// manager is keeping Vault up to date.
 		metrics.ReconcileDone(trigger, result, time.Since(started))
-		ru.h.ReconcileDone(err)
+		if result == metrics.ResultSkipped {
+			// Clean, but not proof of anything: readiness must not go green on a
+			// ConfigMap that has never parsed.
+			ru.h.ReconcileSkipped()
+		} else {
+			ru.h.ReconcileDone(err)
+		}
 		ru.h.Heartbeat(resync + stall)
 		resetTimer(timer, resync)
 	}

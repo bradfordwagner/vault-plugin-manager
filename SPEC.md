@@ -193,6 +193,8 @@ each reconcile so they change without a redeploy:
   time (`GaugeFunc`), not pushed, so the gauges cannot drift from the probes.
   `metrics.RegisterHealth` takes closures rather than a `*health.State`, which
   is what lets `health` import `metrics` without a cycle.
+- A skipped pass keeps a working manager Ready but never opens the startup gate,
+  so a rollout cannot go green on a ConfigMap that has never parsed.
 - `result="skipped"` is a distinct bucket from `error`, and a skipped pass does
   not stamp `last_successful_reconcile_timestamp_seconds` — a ConfigMap that has
   been broken for an hour must not look like a healthy manager.
@@ -200,8 +202,10 @@ each reconcile so they change without a redeploy:
   zero errors rather than no data. No metric is labelled by pod name (unbounded
   cardinality, worthless history).
 - A mount reconcile reports `MountResult{Changed, Reload}`: description and
-  options drift is applied like version drift, but only a version move reloads
-  the plugin, because a reload re-initializes the backend on every HA node.
+  options drift is applied like version drift, but only a version or options
+  move reloads the plugin (options reach the backend at initialization; a
+  description does not), because a reload re-initializes the backend on every
+  HA node.
 - `vault_actions_total` counts writes that landed, not calls attempted: the
   `Ensure*` wrappers return `changed`, and `metrics.VaultActionIf` records only
   on `changed || err != nil`. Steady state is therefore flat, and a persistent

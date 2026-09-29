@@ -296,8 +296,11 @@ log "Checking metrics recorded the reconcile work"
 # Sums every sample line containing the given FIXED string (HELP/TYPE comments
 # stripped first, so a bare metric name matches only real samples).
 metrics_value() {
+  # `|| true` on the match: grep exits 1 on no match and the script runs under
+  # pipefail, so an absent series would abort the run instead of reading 0 --
+  # killing the very assertion meant to report "metric not recorded (still 0)".
   vexec "wget -qO- http://${MGR_IP}:8080/metrics" \
-    | grep -v '^#' | grep -F -- "$1" \
+    | { grep -v '^#' || true; } | { grep -F -- "$1" || true; } \
     | awk '{sum += $NF} END {printf "%d", sum+0}'
 }
 for series in \

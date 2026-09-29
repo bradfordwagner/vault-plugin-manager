@@ -154,13 +154,17 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   to the work it causes". `mountTune` compares only the DECLARED options and
   merges them over the live ones, so Vault-maintained options are neither
   compared (which would tune every pass) nor dropped (which a declared-keys-only
-  tune would do); a removed option is caught by the same key-set memory as roles
-  (`mountMemory`), and description/options are reconciled ONLY on a mount that
-  carries the marker. `EnsureMount` returns `MountResult{Changed, Reload}` and
-  **only a version move sets Reload** — a reload tears down and re-initializes
-  the backend on every HA node, which a description edit must not cause. The e2e
-  covers this: it edits the description and asserts the mount is tuned while
-  `reloaded plugin` does not appear.
+  tune would do). On an owned mount the declared options are ABSOLUTE (declared +
+  marker), so an option removed from the ConfigMap is removed from Vault; that is
+  read off the spec rather than a memory of what this process wrote, because a
+  restart wipes such a memory and reasserting from it writes the stale option
+  back. Description and options are reconciled ONLY on a mount carrying the
+  marker. `EnsureMount` returns `MountResult{Changed, Reload}`: a version move
+  reloads (new binary) and an **options** change reloads (Vault hands options to
+  the backend as its config at init, so a tune alone persists them without
+  putting them in effect), while a **description** change does not — a reload
+  re-initializes the backend on every HA node. The e2e edits the description and
+  asserts the mount is tuned with no `reloaded plugin` line.
 - **Prune modes** (`full` | `deregister` | `never`) — documented in README and on
   the `config.PruneMode` constants. Catalog pruning only deregisters a version
   that was attached to a pruned managed mount and is no longer referenced.
@@ -183,8 +187,11 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   into a static 200 — a loop wedged on a hung exec/fetch/Vault call is exactly
   the failure it exists to catch. `/readyz` is a sticky startup gate (true on the
   first clean pass) so rollouts gate on a real reconcile without flapping on a
-  transient Vault error; a skipped pass (absent/invalid ConfigMap) counts as
-  clean. The probe server starts **before** the Vault login so the bounded
+  transient Vault error. A skipped pass (absent/invalid ConfigMap) counts as
+  clean — it must not unready a manager that has been working — but it does NOT
+  open the gate (`health.ReconcileSkipped`): a ConfigMap that has never parsed
+  has reconciled nothing, and a rollout gating on readiness must not go green on
+  it. The probe server starts **before** the Vault login so the bounded
   ignition retry reports live-but-not-ready, not a dead port.
 - **Vault token health feeds both probes, graced twice.** The client's
   login/renew loop reports through `vault.TokenObserver` (`internal/vault/client.go`);

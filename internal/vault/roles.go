@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"vault-plugin-manager/internal/logging"
 )
 
 // Role is a secret-engine role written to <Mount>/<RolesPath>/<Name>. Data is
@@ -84,9 +86,21 @@ func roleKeySet(data map[string]any) string {
 // read fails, or the plugin does not serve a readable role — all of which mean
 // "cannot compare", so the caller writes, which is exactly what this client did
 // before the comparison existed. A read that fails must never fail a reconcile.
+//
+// A non-404 failure IS logged, because the likeliest cause is a policy written
+// before this client read roles at all: without `read` on the role path every
+// role then costs a denied read plus the write it was meant to avoid, on every
+// pass, and nothing else would ever say why.
 func (c *Client) readRole(ctx context.Context, path string) (map[string]any, bool) {
 	secret, err := c.api.Logical().ReadWithContext(ctx, path)
-	if err != nil || secret == nil || secret.Data == nil {
+	if err != nil {
+		if !isNotFound(err) {
+			logging.Log().With("component", "vault", "path", path, "error", err).
+				Warn("cannot read role to compare it; writing unconditionally (does the policy grant read on this path?)")
+		}
+		return nil, false
+	}
+	if secret == nil || secret.Data == nil {
 		return nil, false
 	}
 	return secret.Data, true

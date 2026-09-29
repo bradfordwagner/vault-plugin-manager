@@ -209,6 +209,18 @@ func (s *State) ReconcileDone(err error) {
 	s.ready = true
 }
 
+// ReconcileSkipped records a pass the Runner declined to make because the
+// ConfigMap was absent, empty, or unparseable. It counts as a clean pass -- the
+// user's spec is wrong, not the manager -- so it never unreadies a pod that has
+// been working. It does NOT open the startup gate: a manager whose ConfigMap has
+// never parsed has reconciled nothing, and a rollout that gates on readiness
+// must not go green on it.
+func (s *State) ReconcileSkipped() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastPass = s.now()
+}
+
 // report is the probe response body: the same document on both endpoints, so a
 // failing probe can be diagnosed by curling either one.
 type report struct {

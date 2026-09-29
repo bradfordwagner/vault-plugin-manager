@@ -458,3 +458,35 @@ func TestHandlerServesMetricsOnTheProbePort(t *testing.T) {
 		t.Error("want vpm_ metrics in the body served on the probe port")
 	}
 }
+
+// A skipped pass is clean -- the user's spec is wrong, not the manager -- but it
+// is not proof that anything reconciled. A ConfigMap that has NEVER parsed must
+// not open the startup gate, or `helm --wait` and a rollout both go green on a
+// manager that has done nothing.
+func TestSkippedPassDoesNotOpenTheStartupGate(t *testing.T) {
+	s, _ := newTestState(t)
+	s.Heartbeat(time.Hour)
+	s.TokenValid()
+
+	s.ReconcileSkipped()
+	if s.Ready() {
+		t.Fatal("want not ready: no reconcile has ever happened")
+	}
+	if got := s.snapshot().Reason; got != "waiting for the first successful reconcile" {
+		t.Errorf("reason = %q", got)
+	}
+	if !s.Live() {
+		t.Error("want live: a bad ConfigMap is not a wedged loop")
+	}
+
+	// Once a real pass lands, a later skip must not unready the pod: an edit that
+	// breaks the ConfigMap should not tear a working manager out of service.
+	s.ReconcileDone(nil)
+	if !s.Ready() {
+		t.Fatal("want ready after a real pass")
+	}
+	s.ReconcileSkipped()
+	if !s.Ready() {
+		t.Error("a skipped pass must not unready a manager that has been working")
+	}
+}
