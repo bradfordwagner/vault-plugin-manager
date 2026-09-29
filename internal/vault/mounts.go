@@ -71,11 +71,12 @@ func (c *Client) ensureSecretMount(ctx context.Context, m Mount) (bool, error) {
 		}
 		return true, nil
 	}
-	if sameVersion(existing.PluginVersion, m.Version) {
+	tune, drift := mountTune(existing.PluginVersion, existing.Description, existing.Options, m)
+	if !drift {
 		return false, nil
 	}
-	if err := c.api.Sys().TuneMountAllowNilWithContext(ctx, path, api.TuneMountConfigInput{PluginVersion: &m.Version}); err != nil {
-		return false, fmt.Errorf("vault: pinning secret mount %q to %s: %w", path, m.Version, err)
+	if err := c.api.Sys().TuneMountAllowNilWithContext(ctx, path, tune); err != nil {
+		return false, fmt.Errorf("vault: tuning secret mount %q: %w", path, err)
 	}
 	return true, nil
 }
@@ -98,14 +99,70 @@ func (c *Client) ensureAuthMount(ctx context.Context, m Mount) (bool, error) {
 		}
 		return true, nil
 	}
-	if sameVersion(existing.PluginVersion, m.Version) {
+	tune, drift := mountTune(existing.PluginVersion, existing.Description, existing.Options, m)
+	if !drift {
 		return false, nil
 	}
 	// Auth mounts are tuned under the "auth/" prefix.
-	if err := c.api.Sys().TuneMountAllowNilWithContext(ctx, "auth/"+path, api.TuneMountConfigInput{PluginVersion: &m.Version}); err != nil {
-		return false, fmt.Errorf("vault: pinning auth mount %q to %s: %w", path, m.Version, err)
+	if err := c.api.Sys().TuneMountAllowNilWithContext(ctx, "auth/"+path, tune); err != nil {
+		return false, fmt.Errorf("vault: tuning auth mount %q: %w", path, err)
 	}
 	return true, nil
+}
+
+// mountTune builds the tune input that brings an existing mount in line with m,
+// and reports whether anything actually differs.
+//
+// Version, description AND options are all reconciled. Description and options
+// are only sent on the initial enable otherwise, which made an edit to either a
+// silent no-op: the change log reported it (config.Diff emits `description` and
+// `options`), the reconcile succeeded, and Vault kept the old value forever --
+// breaking the rule that a logged change maps to the work it causes.
+//
+// Only the options the spec DECLARES are compared, and a tune carries the live
+// options with the declared ones merged over them. Two reasons: Vault maintains
+// options of its own on some engines (demanding an exact map would tune on every
+// pass, the same trap the role comparison avoids), and a tune that sent only the
+// declared keys would DROP the rest.
+//
+// The ownership marker is added only to a mount that already carries it. A mount
+// that exists at a declared path but was not created by this manager stays
+// unmarked, so it stays outside the prune pass -- adopting it here would make
+// somebody else's mount deletable the moment the path left the ConfigMap.
+func mountTune(existingVersion, existingDesc string, existingOpts map[string]string, m Mount) (api.TuneMountConfigInput, bool) {
+	var tune api.TuneMountConfigInput
+	drift := false
+
+	if !sameVersion(existingVersion, m.Version) {
+		tune.PluginVersion = &m.Version
+		drift = true
+	}
+	if existingDesc != m.Description {
+		tune.Description = &m.Description
+		drift = true
+	}
+	if merged, changed := mergedOptions(existingOpts, m.Options); changed {
+		tune.Options = &merged
+		drift = true
+	}
+	return tune, drift
+}
+
+// mergedOptions overlays the declared options on the live ones, reporting
+// whether that changes anything.
+func mergedOptions(existing, declared map[string]string) (map[string]string, bool) {
+	merged := make(map[string]string, len(existing)+len(declared))
+	for k, v := range existing {
+		merged[k] = v
+	}
+	changed := false
+	for k, v := range declared {
+		if merged[k] != v {
+			merged[k] = v
+			changed = true
+		}
+	}
+	return merged, changed
 }
 
 // DisableMount disables (unmounts) a secret or auth engine. A missing mount is

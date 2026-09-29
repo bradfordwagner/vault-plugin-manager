@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,15 +28,56 @@ type Role struct {
 // write is idempotent for the plugin but still a real Vault call and a real
 // audit-log entry on every reconcile, and it leaves the role_upsert metric
 // permanently non-zero.
+//
+// A REMOVED key is written even though the keys that remain still match, and so
+// is the first sighting of a role in this process. Only declared keys can be
+// compared (see roleUpToDate), so dropping "max_ttl" from the spec otherwise
+// looks identical to never having declared it, and the old value would live in
+// Vault forever -- silently, since the change log reports the key as moved. The
+// first-sighting write is what makes a removal that happened while the manager
+// was DOWN converge too: there is no record to compare that edit against.
 func (c *Client) EnsureRole(ctx context.Context, r Role) (changed bool, err error) {
 	path := normPath(r.Mount) + "/" + r.RolesPath + "/" + r.Name
-	if existing, ok := c.readRole(ctx, path); ok && roleUpToDate(existing, r.Data) {
-		return false, nil
+
+	if c.sameRoleKeysAsLastWrite(path, r.Data) {
+		if existing, ok := c.readRole(ctx, path); ok && roleUpToDate(existing, r.Data) {
+			return false, nil
+		}
 	}
 	if _, err := c.api.Logical().WriteWithContext(ctx, path, r.Data); err != nil {
 		return false, fmt.Errorf("vault: writing role %s: %w", path, err)
 	}
+	c.recordRoleKeys(path, r.Data)
 	return true, nil
+}
+
+// sameRoleKeysAsLastWrite reports whether this process has already written path
+// with exactly this set of keys, which is the precondition for trusting a
+// declared-keys-only comparison.
+func (c *Client) sameRoleKeysAsLastWrite(path string, data map[string]any) bool {
+	c.roleMu.Lock()
+	defer c.roleMu.Unlock()
+	written, ok := c.roleKeys[path]
+	return ok && written == roleKeySet(data)
+}
+
+func (c *Client) recordRoleKeys(path string, data map[string]any) {
+	c.roleMu.Lock()
+	defer c.roleMu.Unlock()
+	if c.roleKeys == nil {
+		c.roleKeys = make(map[string]string)
+	}
+	c.roleKeys[path] = roleKeySet(data)
+}
+
+// roleKeySet renders a role body's key names as one comparable string.
+func roleKeySet(data map[string]any) string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "\x00")
 }
 
 // readRole returns the live role body. ok is false when the role is absent, the
@@ -72,8 +115,10 @@ func roleUpToDate(existing, desired map[string]any) bool {
 // 300, and numbers decode as json.Number rather than int. Comparing with
 // reflect.DeepEqual instead makes every such field differ on every pass.
 func sameRoleValue(got, want any) bool {
+	// A declared empty list and a plugin that reports the field as null are the
+	// same state; treating them as different rewrites the role on every pass.
 	if got == nil || want == nil {
-		return got == nil && want == nil
+		return emptyList(got) && emptyList(want)
 	}
 
 	// Numbers, including a duration string read back as seconds.
@@ -96,14 +141,29 @@ func sameRoleValue(got, want any) bool {
 		return false
 	}
 
-	// Lists: order-sensitive, because the plugin may treat order as meaningful.
+	// Lists compare as multisets. Vault secret engines commonly store list-ish
+	// fields as sets and read them back sorted or deduplicated, so an index-by-
+	// index comparison would report drift on every pass for a plugin that
+	// reorders -- rewriting the role forever, which is the exact failure this
+	// comparison exists to prevent. The cost is that a pure REORDER of a list
+	// whose plugin does treat order as meaningful is not detected; declare such
+	// a field's change by also changing a value if that ever matters.
 	if wl, ok := asSlice(want); ok {
 		gl, ok := asSlice(got)
 		if !ok || len(gl) != len(wl) {
 			return false
 		}
-		for i := range wl {
-			if !sameRoleValue(gl[i], wl[i]) {
+		used := make([]bool, len(gl))
+		for _, w := range wl {
+			matched := false
+			for i, g := range gl {
+				if used[i] || !sameRoleValue(g, w) {
+					continue
+				}
+				used[i], matched = true, true
+				break
+			}
+			if !matched {
 				return false
 			}
 		}
@@ -125,6 +185,16 @@ func sameRoleValue(got, want any) bool {
 		return false
 	}
 	return got == want
+}
+
+// emptyList reports whether v is nil or an empty list, the two ways "no values"
+// crosses the write/read-back boundary.
+func emptyList(v any) bool {
+	if v == nil {
+		return true
+	}
+	l, ok := asSlice(v)
+	return ok && len(l) == 0
 }
 
 // asNumber reports v as a float64 if it is numeric. Vault's API decodes JSON

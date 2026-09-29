@@ -170,8 +170,14 @@ each reconcile so they change without a redeploy:
   reconcile its stale cache forever while looking healthy. A watch that is
   erroring but still relisting fails readiness after `watchGracePeriod`; normal
   churn (EOF, 410 Gone, resource expired) is classified benign, mirroring
-  client-go. NOT covered: a watch that is alive but silently delivers nothing —
-  that needs a periodic ground-truth GET, deliberately not built.
+  client-go. A failure must be ONGOING to unready the pod: client-go retries a
+  broken watch continuously, so a watch that stops reporting has recovered, and
+  the failure is cleared. A delivered event cannot be the only recovery signal,
+  because a relist of an unchanged ConfigMap delivers none (client-go drops sync
+  notifications at `resync=0`). The first-failure clock still decides the grace,
+  so continuous failures cannot hold the probes green. NOT covered: a watch that
+  is alive but silently delivers nothing — that needs a periodic ground-truth
+  GET, deliberately not built.
 - The server starts before the Vault login so the bounded ignition retry (3m)
   reports live-but-not-ready instead of an unanswered port.
 

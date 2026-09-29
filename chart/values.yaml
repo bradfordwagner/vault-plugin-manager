@@ -160,13 +160,20 @@ serviceAccount:
   name: ""            # defaults to the fullname
   annotations: {}
 
+# Sized for the fetch, which is the memory peak: the fetchers hold the whole
+# plugin in memory at once (the download buffer plus the extracted binary, or a
+# buffered OCI layer), and the binary is held again while it is exec-copied to
+# each Vault pod. A 128Mi limit OOMKilled the e2e on 2 of 3 matrix legs with a
+# TINY test plugin, and an OOMKill during a fetch is invisible to the probes --
+# the container is killed, restarts, re-fetches, and never converges. Raise
+# these further for a large plugin; they scale with plugin size, not cluster size.
 resources:
   requests:
     cpu: 50m
-    memory: 64Mi
-  limits:
-    cpu: 250m
     memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
 
 nodeSelector: {}
 tolerations: []

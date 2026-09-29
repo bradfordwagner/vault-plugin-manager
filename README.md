@@ -128,6 +128,12 @@ verbatim to the plugin, which owns the schema — vpm only owns *placement*.
   (plus `create`/`update`/`delete`, and `list` for pruning). Without `read` — or
   for a plugin that does not serve role reads — the write simply happens
   unconditionally, as it did before: correct, just not quiet.
+- **Removing a key** from a role's `data` is applied, not skipped: the manager
+  remembers the key set it last wrote and writes again when that set shrinks, so
+  the field goes back to the plugin's default. Each role is also written once on
+  the first pass after a restart, which is what applies an edit made while the
+  manager was down. List values compare as sets — a plugin that reorders them is
+  not treated as drift, so a pure reorder of a list is not detected.
 - Under `pruneMode: full`, a role under a *declared* `rolesPath` on a managed mount
   that is not listed here is deleted. **Limitation:** a `rolesPath` the ConfigMap
   never declares is never enumerated, so its stale roles are not pruned — vpm stays

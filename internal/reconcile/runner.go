@@ -88,8 +88,11 @@ func NewRunner(rec *Reconciler, kc *k8s.Client, ns, name, key string, h Health) 
 // Run starts the informer and the reconcile loop, blocking until ctx is cancelled.
 func (ru *Runner) Run(ctx context.Context) error {
 	handler := k8s.ConfigMapHandler{
-		// A delivered event — a real change or a relist — proves the watch is
-		// working, so it clears any recorded watch failure.
+		// A delivered event proves the watch is working, so it clears any
+		// recorded watch failure. It is NOT the only proof: a relist of an
+		// UNCHANGED ConfigMap delivers no event here (client-go drops sync
+		// notifications for a listener registered with resync=0), so recovery
+		// is also inferred in health.State from failures going quiet.
 		OnChange: func(cm *corev1.ConfigMap) {
 			ru.h.WatchHealthy()
 			ru.set(cm.Data[ru.key], true)

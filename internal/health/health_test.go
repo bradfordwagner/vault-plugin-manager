@@ -207,6 +207,8 @@ func TestStoppedWatcherFailsLivenessImmediately(t *testing.T) {
 }
 
 // A watch that errors but keeps relisting is graced, and only unreadies the pod.
+// client-go retries a broken watch continuously, so a watch that is still down
+// keeps reporting; the failures below model that.
 func TestWatchErrorsGraceThenUnready(t *testing.T) {
 	s, advance := newTestState(t)
 	s.ReconcileDone(nil)
@@ -217,7 +219,10 @@ func TestWatchErrorsGraceThenUnready(t *testing.T) {
 		t.Fatal("want ready inside the watch grace")
 	}
 
-	advance(3 * time.Minute) // past the 2m grace
+	for i := 0; i < 3; i++ { // 3m of continuous failure, past the 2m grace
+		advance(time.Minute)
+		s.WatchError(errors.New("connection refused"))
+	}
 	if s.Ready() {
 		t.Fatal("want not ready once the watch has failed past the grace")
 	}
@@ -264,9 +269,41 @@ func TestSetWatchGraceOverridesTheWindow(t *testing.T) {
 	s.SetWatchGrace(30 * time.Second)
 
 	s.WatchError(errors.New("boom"))
-	advance(45 * time.Second)
+	advance(20 * time.Second)
+	s.WatchError(errors.New("boom"))
+	advance(25 * time.Second)
 	if s.Ready() {
 		t.Fatal("want not ready past the 30s watch grace")
+	}
+}
+
+// A watch that errors ONCE and then recovers must go ready again on its own.
+// The recovery is often a relist of an unchanged ConfigMap, which delivers no
+// event, so nothing calls WatchHealthy: without this, one transient apiserver
+// blip would 503 readiness until somebody happened to edit the ConfigMap.
+func TestWatchErrorClearsOnceFailuresStop(t *testing.T) {
+	s, advance := newTestState(t)
+	s.ReconcileDone(nil)
+	s.Heartbeat(time.Hour)
+
+	s.WatchError(errors.New("connection refused"))
+	advance(3 * time.Minute) // no further failure reported: client-go relisted
+	if !s.Ready() {
+		t.Fatalf("want ready again once failures stopped; reason=%q", s.snapshot().Reason)
+	}
+
+	// ...and a watch that starts failing again is graced from its FIRST new
+	// failure, not held against the old one.
+	s.WatchError(errors.New("connection refused"))
+	if !s.Ready() {
+		t.Fatal("want ready inside the grace of the new failure")
+	}
+	for i := 0; i < 3; i++ {
+		advance(time.Minute)
+		s.WatchError(errors.New("connection refused"))
+	}
+	if s.Ready() {
+		t.Fatal("want not ready: the watch has been failing continuously past the grace")
 	}
 }
 

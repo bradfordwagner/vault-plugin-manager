@@ -116,6 +116,13 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   duration/number normalization in `sameRoleValue`. A `reflect.DeepEqual` here
   reports drift forever and just trades one always-on counter for another. A role
   Vault will not serve back (read fails/unsupported) falls back to writing.
+  Two consequences of comparing only declared keys, both load-bearing: the client
+  remembers the key set it last wrote per role path and **writes when a key is
+  removed** (the remaining keys still match, so nothing else would notice) and on
+  the **first sighting of a role in the process** (which is what applies an edit
+  made while the manager was down). Lists compare as MULTISETS, and a declared
+  empty list equals a `null` read-back — plugins that store list fields as sets
+  reorder them, and an index-by-index compare would rewrite the role forever.
 - **Reconciler is testable.** It depends on narrow `VaultOps` / `PodOps`
   interfaces (satisfied by the real clients) and the `fetch.Fetcher` interface,
   so `reconcile_test.go` drives it with fakes — no cluster or Vault required.
@@ -137,7 +144,17 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   so multiple versions coexist and Vault's registration `command` is that name.
 - **Ownership marker.** Mounts the manager creates carry a
   `managed-by=vault-plugin-manager` option. Pruning (`ListManagedMounts`) only
-  ever touches marked mounts, never foreign ones.
+  ever touches marked mounts, never foreign ones. A **tune never adds the
+  marker** (`mountTune`, `internal/vault/mounts.go`): a mount that already exists
+  at a declared path was somebody else's, and marking it would make it deletable
+  the moment that path left the ConfigMap.
+- **Mount drift includes description and options, not just version.** They used
+  to be sent only on the initial enable, which made an edit to either a silent
+  no-op that `config.Diff` nonetheless reported — breaking "a logged change maps
+  to the work it causes". `mountTune` compares only the DECLARED options and
+  merges them over the live ones, so Vault-maintained options are neither
+  compared (which would tune every pass) nor dropped (which a declared-keys-only
+  tune would do).
 - **Prune modes** (`full` | `deregister` | `never`) — documented in README and on
   the `config.PruneMode` constants. Catalog pruning only deregisters a version
   that was attached to a pruned managed mount and is no longer referenced.
@@ -179,7 +196,14 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   readiness, after `watchGracePeriod`. Benign churn (EOF, 410 Gone, resource
   expired) must stay classified benign in `benignWatchError` — client-go asks for
   a randomized 5-10m watch timeout, so counting those would fire the probe
-  constantly. Any delivered event clears a recorded failure.
+  constantly. Any delivered event clears a recorded failure — but an event is
+  NOT the only recovery signal, and must not be treated as one: client-go drops
+  sync notifications for a listener registered with `resync=0`, so a relist of an
+  UNCHANGED ConfigMap delivers nothing. Readiness therefore requires failures to
+  be ONGOING (`watchLastErr` within the grace); a watch that errors once and
+  recovers clears itself, while a watch retrying every second still fails the
+  probe because the FIRST-failure clock decides the grace. Without that, one
+  apiserver blip 503s readiness until somebody edits the ConfigMap.
 - **Change logging: diff first, then actions.** `config.Diff` (`internal/config/diff.go`)
   reports what moved in the ConfigMap and the Runner logs one Info line per
   change before reconciling; the reconciler's existing logs record the work. Diff
