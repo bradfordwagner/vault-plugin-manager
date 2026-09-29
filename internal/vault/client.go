@@ -6,6 +6,7 @@ package vault
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"vault-plugin-manager/internal/logging"
@@ -55,6 +56,16 @@ type Client struct {
 	api *api.Client
 	cfg Config
 	obs TokenObserver
+
+	// roleKeys remembers, per role path, the key set this process last wrote, so
+	// EnsureRole can tell "the spec dropped this key" (which must be written)
+	// from "the spec never declared it" (a plugin default, which must be left
+	// alone). A role body carries the plugin's defaults for everything it omits,
+	// so unlike mount options its desired state cannot be read off the spec
+	// alone. Reconciles are serial today, but the mutex keeps that from being
+	// load-bearing.
+	stateMu  sync.Mutex
+	roleKeys map[string]string
 }
 
 // New builds a Vault API client from cfg. It does not log in; call Authenticate.

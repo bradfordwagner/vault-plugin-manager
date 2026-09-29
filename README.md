@@ -56,7 +56,7 @@ Configuration is split in two:
 | `logLevel` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `stallTimeout` | `10m` | how long one reconcile pass may run before liveness fails |
 | `tokenGracePeriod` | `2m` | how long the Vault token may be invalid before readiness drops |
-| `tokenFailTimeout` | `15m` | how long the Vault token may be invalid before liveness drops |
+| `tokenFailTimeout` | `15m`, or `tokenGracePeriod` if that is larger | how long the Vault token may be invalid before liveness drops |
 | `watchGracePeriod` | `2m` | how long the ConfigMap watch may fail before readiness drops |
 
 **`pruneMode`** controls what happens when a mount or plugin version the manager
@@ -120,6 +120,31 @@ verbatim to the plugin, which owns the schema — vpm only owns *placement*.
   `<mount>/realm/<realm>/roles/<name>`, for plugins that use a deeper, plugin-owned
   role hierarchy. It is trimmed of surrounding slashes; empty, `.`/`..`, or
   double-slash segments are rejected.
+- A role is **read back and compared before writing**, so an unchanged spec issues
+  no Vault write and no audit-log entry on every resync. Only the keys `data`
+  declares are compared, after normalizing what Vault rewrites on read-back (a
+  `"5m"` TTL reads back as `300`); fields the spec omits are the plugin's defaults
+  and are ignored. The manager's policy therefore wants `read` on the role path
+  (plus `create`/`update`/`delete`, and `list` for pruning). Without `read` — or
+  for a plugin that does not serve role reads — the write simply happens
+  unconditionally, as it did before: correct, just not quiet.
+- **Removing a key** from a role's `data` is applied, not skipped: the manager
+  remembers the key set it last wrote and writes again when that set shrinks, so
+  the field goes back to the plugin's default. Each role is also written once on
+  the first pass after a restart, which is what applies an edit made while the
+  manager was down. List values compare as sets — a plugin that reorders them is
+  not treated as drift, so a pure reorder of a list is not detected.
+- Mount `config.description` and `config.options` are reconciled on every pass,
+  not just at creation: editing either is applied by a tune, and an option removed
+  from the spec is removed from the mount (on a managed mount the declared options
+  are the whole truth; the removal is sent to Vault as an empty value, which is
+  how its tune endpoint expresses a deletion). A **version or options change reloads the plugin** —
+  Vault hands a mount's options to the backend at initialization, so without a
+  reload they would be stored but not in effect — while a **description edit does
+  not**, since a reload re-initializes the backend on every HA node. Mounts this
+  manager did not create keep their own description and options; only their
+  version is pinned — and a declared description or options on such a mount is
+  logged as skipped rather than silently dropped.
 - Under `pruneMode: full`, a role under a *declared* `rolesPath` on a managed mount
   that is not listed here is deleted. **Limitation:** a `rolesPath` the ConfigMap
   never declares is never enumerated, so its stale roles are not pruned — vpm stays
@@ -135,7 +160,7 @@ by request handling. Two endpoints on `HEALTH_ADDR` (`:8080` by default) answer
 | Endpoint | Probe | Semantics |
 |----------|-------|-----------|
 | `/healthz` | liveness | A **watchdog on the reconcile loop**, plus the Vault token and the ConfigMap watcher. Before each wait the loop declares when its next signal is due (`resyncInterval + stallTimeout` while idle, `stallTimeout` while a pass runs). A loop stuck on a hung exec, fetch, or Vault call misses that deadline. It also fails once the Vault token has been invalid for `tokenFailTimeout`, or the ConfigMap informer has stopped. |
-| `/readyz` | readiness | A **startup gate**, plus the Vault token and the ConfigMap watch. It flips true on the first clean reconcile pass, so `helm --wait` / `kubectl rollout status` gates on the manager actually reconciling. It drops again while the Vault token has been invalid for longer than `tokenGracePeriod`, or the watch has been failing for longer than `watchGracePeriod`. Reconcile errors appear in the body's `lastError` but do not unready the pod, so a transient error doesn't flap the rollout. |
+| `/readyz` | readiness | A **startup gate**, plus the Vault token and the ConfigMap watch. It flips true on the first clean reconcile pass, so `helm --wait` / `kubectl rollout status` gates on the manager actually reconciling — a pass skipped because the ConfigMap is absent or invalid does not count, since nothing was reconciled. It drops again while the Vault token has been invalid for longer than `tokenGracePeriod`, or the watch has been failing for longer than `watchGracePeriod`. Reconcile errors appear in the body's `lastError` but do not unready the pod, so a transient error doesn't flap the rollout. |
 
 ### Vault token health
 
@@ -155,7 +180,15 @@ probe body carries `tokenValid`, `tokenInvalidFor`, and `tokenError`.
 
 `tokenFailTimeout` must be `>=` `tokenGracePeriod` (validated on parse): liveness
 has to outlast readiness, or the pod gets restarted before it's ever reported
-unready.
+unready. An **unset** `tokenFailTimeout` tracks the grace automatically (it is
+`max(15m, tokenGracePeriod)`), so raising `tokenGracePeriod` on its own is safe.
+Setting both, inverted, is still rejected — and note what a rejected spec costs:
+the WHOLE ConfigMap is invalid, so the manager stops reconciling catalog, mounts
+and roles. A manager that was already working stays Ready (a skipped pass must
+not tear it out of service), so watch
+`vpm_last_successful_reconcile_timestamp_seconds` and the `invalid configmap
+spec` error log — though a pod that has NEVER parsed its ConfigMap never goes
+Ready at all, so a fresh rollout fails visibly.
 
 ### ConfigMap watcher health
 
@@ -222,6 +255,13 @@ Kubernetes RBAC** — the endpoint reads only in-process state.
 | `vpm_build_info` | gauge | `version` |
 
 Plus the standard Go runtime and process collectors.
+
+`vpm_vault_actions_total` counts writes that actually landed, not calls made:
+an `Ensure*` that finds Vault already correct records nothing, so the counter is
+**flat at steady state** and the churn alert below means what it says. Errors are
+always counted, even though no write landed — a failing attempt is the thing you
+want to see. The zero-valued series still exist from startup, so `rate()` reads
+zero rather than no data.
 
 `result="skipped"` is its own bucket, not an error: an absent or unparseable
 ConfigMap is the user's spec being wrong, not the manager being broken. A skipped

@@ -170,8 +170,14 @@ each reconcile so they change without a redeploy:
   reconcile its stale cache forever while looking healthy. A watch that is
   erroring but still relisting fails readiness after `watchGracePeriod`; normal
   churn (EOF, 410 Gone, resource expired) is classified benign, mirroring
-  client-go. NOT covered: a watch that is alive but silently delivers nothing —
-  that needs a periodic ground-truth GET, deliberately not built.
+  client-go. A failure must be ONGOING to unready the pod: client-go retries a
+  broken watch continuously, so a watch that stops reporting has recovered, and
+  the failure is cleared. A delivered event cannot be the only recovery signal,
+  because a relist of an unchanged ConfigMap delivers none (client-go drops sync
+  notifications at `resync=0`). The first-failure clock still decides the grace,
+  so continuous failures cannot hold the probes green. NOT covered: a watch that
+  is alive but silently delivers nothing — that needs a periodic ground-truth
+  GET, deliberately not built.
 - The server starts before the Vault login so the bounded ignition retry (3m)
   reports live-but-not-ready instead of an unanswered port.
 
@@ -187,14 +193,25 @@ each reconcile so they change without a redeploy:
   time (`GaugeFunc`), not pushed, so the gauges cannot drift from the probes.
   `metrics.RegisterHealth` takes closures rather than a `*health.State`, which
   is what lets `health` import `metrics` without a cycle.
+- A skipped pass keeps a working manager Ready but never opens the startup gate,
+  so a rollout cannot go green on a ConfigMap that has never parsed.
 - `result="skipped"` is a distinct bucket from `error`, and a skipped pass does
   not stamp `last_successful_reconcile_timestamp_seconds` — a ConfigMap that has
   been broken for an hour must not look like a healthy manager.
 - The alerting label combinations are pre-seeded at zero so a new pod reads as
   zero errors rather than no data. No metric is labelled by pod name (unbounded
   cardinality, worthless history).
-- Steady-state `vault_actions_total` should be flat; a persistent rate is the
-  signature of the idempotency bug class described in the version-prefix note.
+- A mount reconcile reports `MountResult{Changed, Reload}`: description and
+  options drift is applied like version drift, but only a version or options
+  move reloads the plugin (options reach the backend at initialization; a
+  description does not), because a reload re-initializes the backend on every
+  HA node.
+- `vault_actions_total` counts writes that landed, not calls attempted: the
+  `Ensure*` wrappers return `changed`, and `metrics.VaultActionIf` records only
+  on `changed || err != nil`. Steady state is therefore flat, and a persistent
+  rate is the signature of the idempotency bug class described in the
+  version-prefix note. Counting the attempt instead puts three actions at a
+  permanent non-zero rate and hides a real regression in that floor.
 
 Command shape: `vault-plugin-manager serve` (long-running). A `reconcile` one-shot
 subcommand is a nice-to-have for CI/debugging.

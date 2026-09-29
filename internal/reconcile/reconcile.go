@@ -26,11 +26,11 @@ const pluginFileMode = "0755"
 type VaultOps interface {
 	EnsurePlugin(ctx context.Context, p vault.Plugin) (changed bool, err error)
 	DeregisterPlugin(ctx context.Context, name, pluginType, version string) error
-	EnsureMount(ctx context.Context, m vault.Mount) (changed bool, err error)
+	EnsureMount(ctx context.Context, m vault.Mount) (vault.MountResult, error)
 	DisableMount(ctx context.Context, path, mountType string) error
 	ListManagedMounts(ctx context.Context) ([]vault.ManagedMount, error)
 	ReloadPlugin(ctx context.Context, name string) error
-	EnsureRole(ctx context.Context, r vault.Role) error
+	EnsureRole(ctx context.Context, r vault.Role) (changed bool, err error)
 	ListRoles(ctx context.Context, mount, rolesPath string) ([]string, error)
 	DeleteRole(ctx context.Context, mount, rolesPath, name string) error
 }
@@ -114,7 +114,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 			Command: fileName,
 			SHA256:  res.SHA256,
 		})
-		metrics.VaultAction(metrics.ActionRegister, err)
+		metrics.VaultActionIf(metrics.ActionRegister, changed, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: registering %s@%s: %w", c.Name, c.Version, err)
 		}
@@ -134,7 +134,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 		desiredMounts[mountKey(m.Path, string(m.Type))] = true
 		desiredVersions[nvKey(m.Plugin, m.Version)] = true
 
-		changed, err := r.vault.EnsureMount(ctx, vault.Mount{
+		res, err := r.vault.EnsureMount(ctx, vault.Mount{
 			Path:        m.Path,
 			Plugin:      m.Plugin,
 			Type:        string(m.Type),
@@ -142,12 +142,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 			Description: m.Config.Description,
 			Options:     m.Config.Options,
 		})
-		metrics.VaultAction(metrics.ActionMount, err)
+		metrics.VaultActionIf(metrics.ActionMount, res.Changed, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: mount %s: %w", m.Path, err)
 		}
-		if changed {
+		if res.Changed {
 			r.log.With("mount", m.Path, "version", m.Version).Info("reconciled mount")
+		}
+		// Only a version move needs a reload: it tears down and re-initializes
+		// the backend on every HA node, which a description or options edit has
+		// no business causing.
+		if res.Reload {
 			reload[m.Plugin] = true
 		}
 	}
@@ -194,17 +199,19 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 	desiredRoles := make(map[string]map[string]map[string]bool)
 	for _, role := range spec.Roles {
 		mount := strings.Trim(role.Mount, "/")
-		err := r.vault.EnsureRole(ctx, vault.Role{
+		changed, err := r.vault.EnsureRole(ctx, vault.Role{
 			Mount:     role.Mount,
 			RolesPath: role.RolesPath,
 			Name:      role.Name,
 			Data:      role.Data,
 		})
-		metrics.VaultAction(metrics.ActionRoleUpsert, err)
+		metrics.VaultActionIf(metrics.ActionRoleUpsert, changed, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: role %s/%s/%s: %w", mount, role.RolesPath, role.Name, err)
 		}
-		r.log.With("mount", mount, "rolesPath", role.RolesPath, "role", role.Name).Debug("ensured role")
+		if changed {
+			r.log.With("mount", mount, "rolesPath", role.RolesPath, "role", role.Name).Info("wrote role")
+		}
 		if desiredRoles[mount] == nil {
 			desiredRoles[mount] = make(map[string]map[string]bool)
 		}

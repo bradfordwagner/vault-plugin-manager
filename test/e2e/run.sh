@@ -82,10 +82,22 @@ retry() { # retry <timeout_s> <desc> <cmd...>
   echo "ok: $desc"
 }
 
+# manager_pod prints the name of the LIVE manager pod. A pod that is terminating
+# keeps status.phase=Running until its grace period expires, and rollout status
+# returns before that, so `.items[0]` can be the pod on its way out: the wrong
+# restartCount, or a podIP that stops answering seconds later. Filtering on the
+# absence of a deletionTimestamp is what makes this deterministic.
+manager_pod() {
+  kubectl -n "$NS" get pod -l app.kubernetes.io/name=vault-plugin-manager \
+    --field-selector=status.phase=Running \
+    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' \
+    | head -1
+}
+
 assert_no_restarts() { # $1 = context label
-  local restarts
-  restarts="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=vault-plugin-manager \
-    --field-selector=status.phase=Running -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')"
+  local restarts pod
+  pod="$(manager_pod)"
+  restarts="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
   if [[ "${restarts:-0}" != "0" ]]; then
     echo "FAIL: manager restarted ${restarts}x by '$1'"
     kubectl -n "$NS" describe pod -l app.kubernetes.io/name=vault-plugin-manager | sed -n '/Last State/,/Restart Count/p'
@@ -97,6 +109,14 @@ assert_no_restarts() { # $1 = context label
 configmap_yaml() { # $1 = full|pruned ; emits the ConfigMap
   local oci_block=""
   local oci_mount=""
+  # HTTP_MOUNT_OPTIONS=none drops the declared mount options, which is how the
+  # run exercises an option being REMOVED from the spec.
+  local http_options="
+          options:
+            tier: gold"
+  if [[ "${HTTP_MOUNT_OPTIONS:-}" == "none" ]]; then
+    http_options=""
+  fi
   if [[ "$1" == "full" ]]; then
     oci_block="
       - name: testplugin-oci
@@ -136,7 +156,9 @@ data:
       - path: e2e-http
         plugin: testplugin-http
         type: secret
-        version: "1.0.0"${oci_mount}
+        version: "1.0.0"
+        config:
+          description: "${HTTP_MOUNT_DESC:-e2e http mount}"${http_options}${oci_mount}
 EOF
 }
 
@@ -222,8 +244,8 @@ kubectl -n "$NS" rollout status "deploy/${MANAGER_DEPLOY}" --timeout=180s
 # Prove both probe endpoints actually answer 200. The manager image has no
 # shell, so the request goes from the vault pod's busybox wget (-q exits
 # non-zero on the 503 an unhealthy manager returns).
-MGR_IP="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=vault-plugin-manager \
-  --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')"
+MGR_POD="$(manager_pod)"
+MGR_IP="$(kubectl -n "$NS" get pod "$MGR_POD" -o jsonpath='{.status.podIP}')"
 retry 60 "liveness probe 200"  vexec "wget -qO- http://${MGR_IP}:8080/healthz"
 retry 60 "readiness probe 200" vexec "wget -qO- http://${MGR_IP}:8080/readyz"
 # /metrics rides the same listener; assert it is routed and carries our series.
@@ -280,8 +302,11 @@ log "Checking metrics recorded the reconcile work"
 # Sums every sample line containing the given FIXED string (HELP/TYPE comments
 # stripped first, so a bare metric name matches only real samples).
 metrics_value() {
+  # `|| true` on the match: grep exits 1 on no match and the script runs under
+  # pipefail, so an absent series would abort the run instead of reading 0 --
+  # killing the very assertion meant to report "metric not recorded (still 0)".
   vexec "wget -qO- http://${MGR_IP}:8080/metrics" \
-    | grep -v '^#' | grep -F -- "$1" \
+    | { grep -v '^#' || true; } | { grep -F -- "$1" || true; } \
     | awk '{sum += $NF} END {printf "%d", sum+0}'
 }
 for series in \
@@ -294,9 +319,75 @@ do
   [[ "$got" -gt 0 ]] || { echo "metric not recorded (still 0): $series"; exit 1; }
   echo "ok: ${series} = ${got}"
 done
+##### 10b. a description edit tunes the mount WITHOUT reloading the plugin #####
+# Description and options are reconciled, not just the version, so an edit to
+# either is applied instead of being logged and dropped. A reload, though, tears
+# down and re-initializes the backend on every HA node: only a version move may
+# cause one.
+log "Checking a description edit tunes the mount but does not reload the plugin"
+reloads_before="$(kubectl -n "$NS" logs "$(manager_pod)" --tail=-1 | grep -c "reloaded plugin" || true)"
+# Plain assignment, not an env prefix: bash keeps a prefixed assignment around a
+# FUNCTION call, so this stays explicit about the scope.
+HTTP_MOUNT_DESC="e2e http mount, retuned"
+configmap_yaml pruned | kubectl apply -f -
+retry 60 "description applied to the live mount" bash -c \
+  "kubectl -n $NS exec -i $VPOD -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault read -field=description sys/mounts/e2e-http | grep -q 'retuned'"
+reloads_after="$(kubectl -n "$NS" logs "$(manager_pod)" --tail=-1 | grep -c "reloaded plugin" || true)"
+[[ "$reloads_after" -eq "$reloads_before" ]] || {
+  echo "a description edit reloaded the plugin (${reloads_before} -> ${reloads_after})"
+  exit 1
+}
+echo "ok: description tuned, no reload"
+assert_no_restarts "after retune"
+
 # A skipped or failed pass must never stamp the freshness gauge.
 fresh="$(metrics_value 'vpm_last_successful_reconcile_timestamp_seconds')"
 [[ "$fresh" -gt 0 ]] || { echo "freshness gauge never stamped"; exit 1; }
 echo "ok: freshness gauge stamped"
+
+##### 10c. an option REMOVED from the spec is removed from the mount #####
+# Vault's tune MERGES the option map it is given, deleting only the keys sent
+# with an empty value, so a removal has to be expressed rather than implied. Get
+# this wrong and the mount is tuned -- and, since options reload, the plugin
+# reloaded -- on every pass forever. Unit tests cannot settle which semantics
+# Vault has; this can.
+log "Checking an option removed from the ConfigMap is removed from the mount"
+HTTP_MOUNT_OPTIONS=none
+configmap_yaml pruned | kubectl apply -f -
+retry 60 "tier option removed from the live mount" bash -c \
+  "! kubectl -n $NS exec -i $VPOD -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault read -field=options sys/mounts/e2e-http | grep -q gold"
+# The ownership marker must survive the removal, or the mount stops being
+# prunable and silently leaves this manager's control.
+vexec 'vault read -field=options sys/mounts/e2e-http | grep -q vault-plugin-manager'
+echo "ok: option removed, ownership marker intact"
+assert_no_restarts "after option removal"
+
+# ...and the counters must go FLAT once converged. The counter is meant to read
+# "a steady rate means an idempotency check is missing", which only holds if a
+# no-op pass records nothing: instrumentation placed above the `changed` branch
+# counts attempts, so it climbs forever and hides a real re-registration storm
+# in its own floor. Hold the ConfigMap still for several resyncs (15s each) and
+# require the reconcile counter to move while the write counters do not.
+log "Checking the Vault action counters go flat at steady state"
+reconciles_before="$(metrics_value 'vpm_reconcile_total{result="success"')"
+register_before="$(metrics_value 'vpm_vault_actions_total{action="register",result="success"}')"
+mount_before="$(metrics_value 'vpm_vault_actions_total{action="mount",result="success"}')"
+sleep 45
+reconciles_after="$(metrics_value 'vpm_reconcile_total{result="success"')"
+register_after="$(metrics_value 'vpm_vault_actions_total{action="register",result="success"}')"
+mount_after="$(metrics_value 'vpm_vault_actions_total{action="mount",result="success"}')"
+[[ "$reconciles_after" -gt "$reconciles_before" ]] || {
+  echo "no reconcile passes ran during the steady-state window (${reconciles_before} -> ${reconciles_after}); the check proves nothing"
+  exit 1
+}
+[[ "$register_after" -eq "$register_before" ]] || {
+  echo "register counted a no-op pass: ${register_before} -> ${register_after} across $((reconciles_after - reconciles_before)) passes"
+  exit 1
+}
+[[ "$mount_after" -eq "$mount_before" ]] || {
+  echo "mount counted a no-op pass: ${mount_before} -> ${mount_after} across $((reconciles_after - reconciles_before)) passes"
+  exit 1
+}
+echo "ok: counters flat across $((reconciles_after - reconciles_before)) steady-state passes"
 
 log "E2E PASSED for Vault ${VAULT_VERSION}"

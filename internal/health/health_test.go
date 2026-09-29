@@ -207,6 +207,8 @@ func TestStoppedWatcherFailsLivenessImmediately(t *testing.T) {
 }
 
 // A watch that errors but keeps relisting is graced, and only unreadies the pod.
+// client-go retries a broken watch continuously, so a watch that is still down
+// keeps reporting; the failures below model that.
 func TestWatchErrorsGraceThenUnready(t *testing.T) {
 	s, advance := newTestState(t)
 	s.ReconcileDone(nil)
@@ -217,7 +219,10 @@ func TestWatchErrorsGraceThenUnready(t *testing.T) {
 		t.Fatal("want ready inside the watch grace")
 	}
 
-	advance(3 * time.Minute) // past the 2m grace
+	for i := 0; i < 3; i++ { // 3m of continuous failure, past the 2m grace
+		advance(time.Minute)
+		s.WatchError(errors.New("connection refused"))
+	}
 	if s.Ready() {
 		t.Fatal("want not ready once the watch has failed past the grace")
 	}
@@ -264,9 +269,41 @@ func TestSetWatchGraceOverridesTheWindow(t *testing.T) {
 	s.SetWatchGrace(30 * time.Second)
 
 	s.WatchError(errors.New("boom"))
-	advance(45 * time.Second)
+	advance(20 * time.Second)
+	s.WatchError(errors.New("boom"))
+	advance(25 * time.Second)
 	if s.Ready() {
 		t.Fatal("want not ready past the 30s watch grace")
+	}
+}
+
+// A watch that errors ONCE and then recovers must go ready again on its own.
+// The recovery is often a relist of an unchanged ConfigMap, which delivers no
+// event, so nothing calls WatchHealthy: without this, one transient apiserver
+// blip would 503 readiness until somebody happened to edit the ConfigMap.
+func TestWatchErrorClearsOnceFailuresStop(t *testing.T) {
+	s, advance := newTestState(t)
+	s.ReconcileDone(nil)
+	s.Heartbeat(time.Hour)
+
+	s.WatchError(errors.New("connection refused"))
+	advance(3 * time.Minute) // no further failure reported: client-go relisted
+	if !s.Ready() {
+		t.Fatalf("want ready again once failures stopped; reason=%q", s.snapshot().Reason)
+	}
+
+	// ...and a watch that starts failing again is graced from its FIRST new
+	// failure, not held against the old one.
+	s.WatchError(errors.New("connection refused"))
+	if !s.Ready() {
+		t.Fatal("want ready inside the grace of the new failure")
+	}
+	for i := 0; i < 3; i++ {
+		advance(time.Minute)
+		s.WatchError(errors.New("connection refused"))
+	}
+	if s.Ready() {
+		t.Fatal("want not ready: the watch has been failing continuously past the grace")
 	}
 }
 
@@ -419,5 +456,68 @@ func TestHandlerServesMetricsOnTheProbePort(t *testing.T) {
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "vpm_") {
 		t.Error("want vpm_ metrics in the body served on the probe port")
+	}
+}
+
+// A skipped pass is clean -- the user's spec is wrong, not the manager -- but it
+// is not proof that anything reconciled. A ConfigMap that has NEVER parsed must
+// not open the startup gate, or `helm --wait` and a rollout both go green on a
+// manager that has done nothing.
+func TestSkippedPassDoesNotOpenTheStartupGate(t *testing.T) {
+	s, _ := newTestState(t)
+	s.Heartbeat(time.Hour)
+	s.TokenValid()
+
+	s.ReconcileSkipped()
+	if s.Ready() {
+		t.Fatal("want not ready: no reconcile has ever happened")
+	}
+	if got := s.snapshot().Reason; got != "waiting for the first successful reconcile" {
+		t.Errorf("reason = %q", got)
+	}
+	if !s.Live() {
+		t.Error("want live: a bad ConfigMap is not a wedged loop")
+	}
+
+	// Once a real pass lands, a later skip must not unready the pod: an edit that
+	// breaks the ConfigMap should not tear a working manager out of service.
+	s.ReconcileDone(nil)
+	if !s.Ready() {
+		t.Fatal("want ready after a real pass")
+	}
+	s.ReconcileSkipped()
+	if !s.Ready() {
+		t.Error("a skipped pass must not unready a manager that has been working")
+	}
+}
+
+// Two unrelated blips must not merge into one failure episode. An apiserver
+// rolling restart can produce a watch error, relist cleanly, and error again a
+// minute later; because the ConfigMap did not change, no event is delivered to
+// call WatchHealthy. Keying the episode boundary to the GRACE merged those into
+// one episode dated from the first blip, which then unreadied a watch that had
+// already recovered.
+func TestSeparateWatchBlipsDoNotMerge(t *testing.T) {
+	s, advance := newTestState(t)
+	s.ReconcileDone(nil)
+	s.Heartbeat(time.Hour)
+
+	s.WatchError(errors.New("connection reset")) // t=0
+	advance(90 * time.Second)
+	s.WatchError(errors.New("connection reset")) // t=90s, a fresh episode
+	advance(35 * time.Second)                    // t=125s: past the 2m grace measured from t=0
+
+	if !s.Ready() {
+		t.Fatalf("two separate blips were merged into one episode; reason=%q", s.snapshot().Reason)
+	}
+
+	// A watch that really is stuck still fails: client-go retries it on a
+	// backoff capped around 30s, so the failures keep arriving.
+	for i := 0; i < 6; i++ {
+		advance(25 * time.Second)
+		s.WatchError(errors.New("connection reset"))
+	}
+	if s.Ready() {
+		t.Error("want not ready: the watch has been failing continuously past the grace")
 	}
 }

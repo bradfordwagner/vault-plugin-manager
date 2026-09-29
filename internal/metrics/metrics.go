@@ -258,13 +258,31 @@ func ConfigMapChange(section, action string) {
 }
 
 // VaultAction records one write against Vault, deriving the result from err so
-// call sites stay a single line.
+// call sites stay a single line. Use it only where reaching the call site
+// already means a write was issued; an Ensure* that reports whether it wrote
+// belongs in VaultActionIf.
 func VaultAction(action string, err error) {
 	result := ResultSuccess
 	if err != nil {
 		result = ResultError
 	}
 	vaultActions.WithLabelValues(action, result).Inc()
+}
+
+// VaultActionIf records an Ensure*-style call that may have been a no-op: it
+// counts a failed attempt (the error is the thing to see) and a successful call
+// that actually wrote, and stays silent when nothing was written. Counting the
+// attempt instead would put three actions at a permanent non-zero rate and
+// destroy the only signal this counter exists for -- "flat at steady state, a
+// steady rate means an idempotency check is missing".
+//
+// The pre-seeded {action,result} series are untouched by this: they are created
+// at init, so a no-op still reads 0 rather than "no data".
+func VaultActionIf(action string, changed bool, err error) {
+	if err == nil && !changed {
+		return
+	}
+	VaultAction(action, err)
 }
 
 // SpecEntries records the size of the parsed spec.

@@ -85,7 +85,8 @@ type State struct {
 	// watcherCheck interrogates the ConfigMap informer on demand; nil until the
 	// Runner has one. It must not call back into State.
 	watcherCheck func() error
-	watchErrorAt time.Time // when the watch first started failing
+	watchErrorAt time.Time // when the watch FIRST started failing (never restarted by a repeat)
+	watchLastErr time.Time // when the watch MOST RECENTLY failed
 	watchError   string
 	watchGrace   time.Duration
 }
@@ -127,9 +128,19 @@ func (s *State) SetWatchGrace(d time.Duration) {
 func (s *State) WatchError(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.watchErrorAt.IsZero() {
+	// Start a new failure EPISODE when the watch has been quiet for longer than
+	// a retry cycle: client-go retries a broken watch on a backoff capped around
+	// 30s, so silence for longer than that means the previous problem ended and
+	// this is a fresh one, which gets its own grace. The window is a RETRY cycle,
+	// not the grace: keying it to the grace merged two unrelated blips a minute
+	// apart into one episode, whose clock then started at the first blip and
+	// unreadied a watch that had already recovered. Repeats INSIDE the window
+	// deliberately leave the clock alone -- a watch failing every second must not
+	// hold the probe green by restarting it.
+	if s.watchErrorAt.IsZero() || (!s.watchLastErr.IsZero() && s.now().Sub(s.watchLastErr) > s.watchQuietWindow()) {
 		s.watchErrorAt = s.now()
 	}
+	s.watchLastErr = s.now()
 	if err != nil {
 		s.watchError = err.Error()
 	}
@@ -141,7 +152,20 @@ func (s *State) WatchHealthy() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.watchErrorAt = time.Time{}
+	s.watchLastErr = time.Time{}
 	s.watchError = ""
+}
+
+// watchRetryCycle is how long the watch may be quiet before it counts as
+// recovered. client-go retries a failing watch on a backoff capped at ~30s, so
+// anything longer than that means nothing is failing any more.
+const watchRetryCycle = 60 * time.Second
+
+// watchQuietWindow is the silence that ends a failure episode: a retry cycle,
+// but never longer than the grace itself, so a short configured grace still
+// decides readiness. Callers hold s.mu.
+func (s *State) watchQuietWindow() time.Duration {
+	return min(watchRetryCycle, s.watchGrace)
 }
 
 // SetTokenGrace replaces the token windows from the ConfigMap's settings.
@@ -201,6 +225,18 @@ func (s *State) ReconcileDone(err error) {
 	s.ready = true
 }
 
+// ReconcileSkipped records a pass the Runner declined to make because the
+// ConfigMap was absent, empty, or unparseable. It counts as a clean pass -- the
+// user's spec is wrong, not the manager -- so it never unreadies a pod that has
+// been working. It does NOT open the startup gate: a manager whose ConfigMap has
+// never parsed has reconciled nothing, and a rollout that gates on readiness
+// must not go green on it.
+func (s *State) ReconcileSkipped() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastPass = s.now()
+}
+
 // report is the probe response body: the same document on both endpoints, so a
 // failing probe can be diagnosed by curling either one.
 type report struct {
@@ -247,11 +283,20 @@ func (s *State) snapshot() report {
 
 	// A watch that is erroring but still relisting is graced; a watcher that has
 	// stopped is not, because nothing will restart it in-process.
+	//
+	// Failures must be ONGOING to fail readiness. client-go retries a broken
+	// watch continuously, so a watch that is still down keeps calling
+	// WatchError; one that recovered goes quiet. Without this second test a
+	// single transient error would hold readiness down forever whenever the
+	// recovery is a relist of an UNCHANGED ConfigMap, which delivers no event to
+	// clear it. The FIRST-failure clock still decides the grace, so a watch
+	// failing every second cannot hold the probes green by restarting it.
 	var watchDown time.Duration
 	if !s.watchErrorAt.IsZero() {
 		watchDown = now.Sub(s.watchErrorAt)
 	}
-	watchReady := s.watchErrorAt.IsZero() || watchDown <= s.watchGrace
+	watchFailing := !s.watchErrorAt.IsZero() && now.Sub(s.watchLastErr) <= s.watchQuietWindow()
+	watchReady := !watchFailing || watchDown <= s.watchGrace
 	watcherRunning := watcherErr == nil
 
 	r := report{
@@ -262,9 +307,11 @@ func (s *State) snapshot() report {
 		TokenValid:     s.tokenValid,
 		TokenError:     s.tokenError,
 		WatcherRunning: watcherRunning,
-		WatchError:     s.watchError,
 	}
-	if !s.watchErrorAt.IsZero() {
+	// Only an ONGOING failure is reported: a recovered watch must not keep
+	// showing an error the probe no longer counts.
+	if watchFailing {
+		r.WatchError = s.watchError
 		r.WatchFailingFor = watchDown.Truncate(time.Second).String()
 	}
 	if watcherErr != nil && r.WatchError == "" {

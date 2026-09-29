@@ -23,6 +23,9 @@ type Health interface {
 	Heartbeat(d time.Duration)
 	// ReconcileDone reports the outcome of one pass; nil means a clean pass.
 	ReconcileDone(err error)
+	// ReconcileSkipped reports a pass declined because the ConfigMap was absent,
+	// empty, or unparseable: clean, but no proof that anything reconciled.
+	ReconcileSkipped()
 	// SetTokenGrace applies the ConfigMap's Vault-token health windows.
 	SetTokenGrace(grace, failAfter time.Duration)
 	// SetWatchGrace applies the ConfigMap's watch-error window.
@@ -41,6 +44,7 @@ type noopHealth struct{}
 
 func (noopHealth) Heartbeat(time.Duration)          {}
 func (noopHealth) ReconcileDone(error)              {}
+func (noopHealth) ReconcileSkipped()                {}
 func (noopHealth) SetTokenGrace(_, _ time.Duration) {}
 func (noopHealth) SetWatchGrace(time.Duration)      {}
 func (noopHealth) SetWatcherCheck(func() error)     {}
@@ -88,8 +92,11 @@ func NewRunner(rec *Reconciler, kc *k8s.Client, ns, name, key string, h Health) 
 // Run starts the informer and the reconcile loop, blocking until ctx is cancelled.
 func (ru *Runner) Run(ctx context.Context) error {
 	handler := k8s.ConfigMapHandler{
-		// A delivered event — a real change or a relist — proves the watch is
-		// working, so it clears any recorded watch failure.
+		// A delivered event proves the watch is working, so it clears any
+		// recorded watch failure. It is NOT the only proof: a relist of an
+		// UNCHANGED ConfigMap delivers no event here (client-go drops sync
+		// notifications for a listener registered with resync=0), so recovery
+		// is also inferred in health.State from failures going quiet.
 		OnChange: func(cm *corev1.ConfigMap) {
 			ru.h.WatchHealthy()
 			ru.set(cm.Data[ru.key], true)
@@ -128,9 +135,12 @@ func (ru *Runner) Run(ctx context.Context) error {
 	// exec, fetch, or Vault call fails the probe instead of idling silently.
 	ru.h.Heartbeat(resync + stall)
 
-	// seen is the last spec whose changes were logged, so every ConfigMap edit
-	// is reported exactly once even though the loop is level-triggered.
-	var seen *config.Spec
+	// applied is the last spec that reconciled cleanly; the change log is written
+	// against it, so an edit whose reconcile FAILS is reported again on every
+	// retry instead of scrolling away after one line. counted is the last spec
+	// observed at all, and gates the metric, so a change is counted once no
+	// matter how many times it is retried.
+	var applied, counted *config.Spec
 
 	for {
 		trigger := ""
@@ -143,6 +153,22 @@ func (ru *Runner) Run(ctx context.Context) error {
 			trigger = metrics.TriggerResync
 		}
 
+		// Read the spec BEFORE declaring the watchdog deadline: stallTimeout is a
+		// setting, and applying it a pass late means the FIRST pass -- the cold
+		// start that fetches every plugin and copies it to every Vault pod, i.e.
+		// the slowest one -- always runs against the 10m default. Raising the
+		// setting to cover it would have no effect until a pass had already
+		// completed, so a cold start slower than the default would restart-loop
+		// with the fix ignored. The token and watch windows are hoisted for the
+		// same reason.
+		spec, ok := ru.currentSpec()
+		if ok {
+			resync = spec.Settings.ResyncInterval.Duration()
+			stall = spec.Settings.StallTimeout.Duration()
+			ru.h.SetTokenGrace(spec.Settings.TokenGracePeriod.Duration(), spec.Settings.TokenFailTimeout.Duration())
+			ru.h.SetWatchGrace(spec.Settings.WatchGracePeriod.Duration())
+		}
+
 		// A pass is starting: it gets stall to finish, not the idle budget.
 		ru.h.Heartbeat(stall)
 
@@ -152,33 +178,38 @@ func (ru *Runner) Run(ctx context.Context) error {
 		var err error
 		started := time.Now()
 		result := metrics.ResultSkipped
-		if spec, ok := ru.currentSpec(); ok {
+		if ok {
 			if lvlErr := logging.SetLevel(spec.Settings.LogLevel); lvlErr != nil {
 				ru.log.With("error", lvlErr).Warn("invalid log level in settings")
 			}
-			ru.logChanges(seen, spec, trigger)
-			seen = spec
+			ru.logChanges(applied, spec, trigger, counted)
+			counted = spec
 			metrics.SpecEntries(len(spec.Catalog), len(spec.Mounts), len(spec.Roles))
 			if err = ru.rec.Reconcile(ctx, spec); err != nil {
 				result = metrics.ResultError
 				ru.log.With("error", err).Error("reconcile failed")
 			} else {
 				result = metrics.ResultSuccess
+				// Only a clean pass advances the change log's baseline: until the
+				// work lands, the change is still pending and still worth naming.
+				applied = spec
 				ru.log.Debug("reconcile complete")
 			}
-			resync = spec.Settings.ResyncInterval.Duration()
-			stall = spec.Settings.StallTimeout.Duration()
-			ru.h.SetTokenGrace(spec.Settings.TokenGracePeriod.Duration(), spec.Settings.TokenFailTimeout.Duration())
-			ru.h.SetWatchGrace(spec.Settings.WatchGracePeriod.Duration())
 		} else {
 			// Forget the spec so a ConfigMap that comes back is logged in full.
-			seen = nil
+			applied, counted = nil, nil
 		}
 		// A skipped pass is recorded but deliberately does not stamp the
 		// freshness gauge: an unparseable ConfigMap must not look like the
 		// manager is keeping Vault up to date.
 		metrics.ReconcileDone(trigger, result, time.Since(started))
-		ru.h.ReconcileDone(err)
+		if result == metrics.ResultSkipped {
+			// Clean, but not proof of anything: readiness must not go green on a
+			// ConfigMap that has never parsed.
+			ru.h.ReconcileSkipped()
+		} else {
+			ru.h.ReconcileDone(err)
+		}
 		ru.h.Heartbeat(resync + stall)
 		resetTimer(timer, resync)
 	}
@@ -189,14 +220,26 @@ func (ru *Runner) Run(ctx context.Context) error {
 // reconciler then logs the work itself (copied binary, registered version,
 // reconciled mount, pruned ...), so the two together read as intent followed by
 // action. A pass with nothing new logs only at debug.
-func (ru *Runner) logChanges(old, new *config.Spec, trigger string) {
-	changes := config.Diff(old, new)
+//
+// Changes are reported against the last APPLIED spec, so a change whose
+// reconcile fails keeps being named on every retry -- otherwise the one line
+// naming the edit scrolls away and hours of "reconcile failed" say nothing about
+// which edit is being retried. They are COUNTED against the last spec merely
+// observed, so a retry does not inflate configmap_changes_total.
+func (ru *Runner) logChanges(applied, new *config.Spec, trigger string, counted *config.Spec) {
+	changes := config.Diff(applied, new)
 	if len(changes) == 0 {
 		ru.log.With("trigger", trigger).Debug("reconciling; no configmap changes")
 		return
 	}
+	newToCount := make(map[string]bool)
+	for _, c := range config.Diff(counted, new) {
+		newToCount[c.Section+"\x00"+c.Key+"\x00"+c.Action] = true
+	}
 	for _, c := range changes {
-		metrics.ConfigMapChange(c.Section, c.Action)
+		if newToCount[c.Section+"\x00"+c.Key+"\x00"+c.Action] {
+			metrics.ConfigMapChange(c.Section, c.Action)
+		}
 		ru.log.With(
 			"section", c.Section,
 			"key", c.Key,

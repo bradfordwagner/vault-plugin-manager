@@ -97,6 +97,32 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   watcher gauges are `GaugeFunc` closures over `health.State` (pull, not push),
   which is also what keeps `health` -> `metrics` from being an import cycle.
   Tests assert DELTAS: the collectors are package-level and cannot be reset.
+- **Count writes, not attempts.** Every `Ensure*` returns `changed`; record it
+  with `metrics.VaultActionIf` (records on `changed || err != nil`), never
+  `metrics.VaultAction`, which is only for call sites reached solely when work is
+  really happening (reload, and the prune loops, which `continue` past anything
+  still desired). A counter placed above the `changed` branch counts attempts,
+  which puts register/mount/role_upsert at a permanent non-zero rate, breaks the
+  "flat at steady state" reading the metric exists for, and hides a real
+  re-registration storm in its own floor. The fakes in `reconcile_test.go` model
+  `changed=false` on a repeat, and `TestReconcileSteadyStateRecordsNoVaultActions`
+  reconciles twice and requires the second pass to record nothing — keep it.
+- **Roles are read-compare-write like the other Ensure\*.** `EnsureRole`
+  (`internal/vault/roles.go`) used to write unconditionally, which was real Vault
+  traffic and real audit-log entries on every resync. The comparison is the hard
+  part: Vault normalizes on read-back (a `"5m"` TTL reads back as `300`, numbers
+  arrive as `json.Number`, omitted fields come back as plugin defaults), so
+  `roleUpToDate` compares ONLY the keys the spec declares, through the
+  duration/number normalization in `sameRoleValue`. A `reflect.DeepEqual` here
+  reports drift forever and just trades one always-on counter for another. A role
+  Vault will not serve back (read fails/unsupported) falls back to writing.
+  Two consequences of comparing only declared keys, both load-bearing: the client
+  remembers the key set it last wrote per role path and **writes when a key is
+  removed** (the remaining keys still match, so nothing else would notice) and on
+  the **first sighting of a role in the process** (which is what applies an edit
+  made while the manager was down). Lists compare as MULTISETS, and a declared
+  empty list equals a `null` read-back — plugins that store list fields as sets
+  reorder them, and an index-by-index compare would rewrite the role forever.
 - **Reconciler is testable.** It depends on narrow `VaultOps` / `PodOps`
   interfaces (satisfied by the real clients) and the `fetch.Fetcher` interface,
   so `reconcile_test.go` drives it with fakes — no cluster or Vault required.
@@ -118,7 +144,33 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   so multiple versions coexist and Vault's registration `command` is that name.
 - **Ownership marker.** Mounts the manager creates carry a
   `managed-by=vault-plugin-manager` option. Pruning (`ListManagedMounts`) only
-  ever touches marked mounts, never foreign ones.
+  ever touches marked mounts, never foreign ones. A **tune never adds the
+  marker** (`mountTune`, `internal/vault/mounts.go`): a mount that already exists
+  at a declared path was somebody else's, and marking it would make it deletable
+  the moment that path left the ConfigMap.
+- **Mount drift includes description and options, not just version.** They used
+  to be sent only on the initial enable, which made an edit to either a silent
+  no-op that `config.Diff` nonetheless reported — breaking "a logged change maps
+  to the work it causes". `mountTune` compares only the DECLARED options and
+  merges them over the live ones, so Vault-maintained options are neither
+  compared (which would tune every pass) nor dropped (which a declared-keys-only
+  tune would do). On an owned mount the declared options are ABSOLUTE (declared +
+  marker), so an option removed from the ConfigMap is removed from Vault; that is
+  read off the spec rather than a memory of what this process wrote, because a
+  restart wipes such a memory and reasserting from it writes the stale option
+  back. A removal is sent as an **empty value**: Vault's tune MERGES the map it
+  is given into the stored one and deletes only empty-valued keys, so omitting a
+  key leaves it in place — and since options reload, that would tune AND reload
+  every pass forever. An absent key and an empty value compare equal, so the
+  removal settles. `test/e2e/run.sh` removes an option and then asserts the
+  counters go flat; that is the only ground truth for Vault's actual semantics,
+  so keep it. Description and options are reconciled ONLY on a mount carrying the
+  marker. `EnsureMount` returns `MountResult{Changed, Reload}`: a version move
+  reloads (new binary) and an **options** change reloads (Vault hands options to
+  the backend as its config at init, so a tune alone persists them without
+  putting them in effect), while a **description** change does not — a reload
+  re-initializes the backend on every HA node. The e2e edits the description and
+  asserts the mount is tuned with no `reloaded plugin` line.
 - **Prune modes** (`full` | `deregister` | `never`) — documented in README and on
   the `config.PruneMode` constants. Catalog pruning only deregisters a version
   that was attached to a pruned managed mount and is no longer referenced.
@@ -134,6 +186,12 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   (2) Narrowing `sys/mounts/*` to per-mount paths must also grant `sys/mounts/<name>/tune`
   — `ensureSecretMount` calls `TuneMount` (`.../tune`) on version/config drift, which
   the bare `sys/mounts/<name>` path does not cover. See README "Least-privilege variant".
+- **Settings apply to the pass that reads them.** The Runner reads the spec
+  BEFORE declaring its watchdog deadline, so `stallTimeout` (and the token/watch
+  windows) govern the very first pass. Applying them a pass late meant the cold
+  start — fetch every plugin, copy to every pod, i.e. the slowest pass there is —
+  always ran against the 10m default, so raising the setting to cover it had no
+  effect until a pass had already finished: a restart loop with the fix ignored.
 - **Liveness is a watchdog, not an echo.** The manager serves no traffic, so
   `/healthz` reports on the reconcile loop: the Runner calls `Heartbeat` with its
   next deadline before each wait (`resyncInterval + stallTimeout`) and before
@@ -141,8 +199,11 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   into a static 200 — a loop wedged on a hung exec/fetch/Vault call is exactly
   the failure it exists to catch. `/readyz` is a sticky startup gate (true on the
   first clean pass) so rollouts gate on a real reconcile without flapping on a
-  transient Vault error; a skipped pass (absent/invalid ConfigMap) counts as
-  clean. The probe server starts **before** the Vault login so the bounded
+  transient Vault error. A skipped pass (absent/invalid ConfigMap) counts as
+  clean — it must not unready a manager that has been working — but it does NOT
+  open the gate (`health.ReconcileSkipped`): a ConfigMap that has never parsed
+  has reconciled nothing, and a rollout gating on readiness must not go green on
+  it. The probe server starts **before** the Vault login so the bounded
   ignition retry reports live-but-not-ready, not a dead port.
 - **Vault token health feeds both probes, graced twice.** The client's
   login/renew loop reports through `vault.TokenObserver` (`internal/vault/client.go`);
@@ -160,7 +221,18 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   readiness, after `watchGracePeriod`. Benign churn (EOF, 410 Gone, resource
   expired) must stay classified benign in `benignWatchError` — client-go asks for
   a randomized 5-10m watch timeout, so counting those would fire the probe
-  constantly. Any delivered event clears a recorded failure.
+  constantly. A failure EPISODE ends after silence longer than client-go's retry
+  cycle (`watchRetryCycle`, capped by the grace), NOT after the grace itself:
+  keying it to the grace merged two unrelated blips a minute apart into one
+  episode dated from the first, which unreadied a watch that had already
+  recovered. Any delivered event clears a recorded failure — but an event is
+  NOT the only recovery signal, and must not be treated as one: client-go drops
+  sync notifications for a listener registered with `resync=0`, so a relist of an
+  UNCHANGED ConfigMap delivers nothing. Readiness therefore requires failures to
+  be ONGOING (`watchLastErr` within the grace); a watch that errors once and
+  recovers clears itself, while a watch retrying every second still fails the
+  probe because the FIRST-failure clock decides the grace. Without that, one
+  apiserver blip 503s readiness until somebody edits the ConfigMap.
 - **Change logging: diff first, then actions.** `config.Diff` (`internal/config/diff.go`)
   reports what moved in the ConfigMap and the Runner logs one Info line per
   change before reconciling; the reconciler's existing logs record the work. Diff

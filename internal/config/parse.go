@@ -157,7 +157,7 @@ func (s Settings) validate() error {
 		return fmt.Errorf("settings: watchGracePeriod must be positive")
 	}
 	if s.TokenFailTimeout.Duration() < s.TokenGracePeriod.Duration() {
-		return fmt.Errorf("settings: tokenFailTimeout (%s) must be >= tokenGracePeriod (%s); liveness must outlast readiness",
+		return fmt.Errorf("settings: tokenFailTimeout (%s) must be >= tokenGracePeriod (%s); liveness must outlast readiness. Leave tokenFailTimeout unset to track the grace automatically",
 			s.TokenFailTimeout.Duration(), s.TokenGracePeriod.Duration())
 	}
 	return nil
