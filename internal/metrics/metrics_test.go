@@ -92,6 +92,31 @@ func TestVaultActionDerivesResultFromError(t *testing.T) {
 	}
 }
 
+// VaultActionIf is what keeps the counter honest: it records a write, not an
+// attempt. A no-op Ensure* must leave the series exactly where it was, or every
+// idempotent action sits at a permanent non-zero rate and the "flat at steady
+// state" reading of this metric is worthless.
+func TestVaultActionIfOnlyCountsRealWrites(t *testing.T) {
+	ok := func() float64 {
+		return testutil.ToFloat64(vaultActions.WithLabelValues(ActionRegister, ResultSuccess))
+	}
+	bad := func() float64 {
+		return testutil.ToFloat64(vaultActions.WithLabelValues(ActionRegister, ResultError))
+	}
+	okBefore, errBefore := ok(), bad()
+
+	VaultActionIf(ActionRegister, false, nil)                // no-op: records nothing
+	VaultActionIf(ActionRegister, true, nil)                 // wrote
+	VaultActionIf(ActionRegister, false, errors.New("boom")) // failed attempt still counts
+
+	if got := ok() - okBefore; got != 1 {
+		t.Errorf("want 1 success (the write only), got %v", got)
+	}
+	if got := bad() - errBefore; got != 1 {
+		t.Errorf("want 1 error, got %v", got)
+	}
+}
+
 // A skipped pass must not stamp the freshness gauge: an unparseable ConfigMap
 // cannot be allowed to look like the manager is keeping Vault up to date.
 func TestOnlySuccessStampsFreshness(t *testing.T) {

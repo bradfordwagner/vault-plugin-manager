@@ -120,6 +120,14 @@ verbatim to the plugin, which owns the schema — vpm only owns *placement*.
   `<mount>/realm/<realm>/roles/<name>`, for plugins that use a deeper, plugin-owned
   role hierarchy. It is trimmed of surrounding slashes; empty, `.`/`..`, or
   double-slash segments are rejected.
+- A role is **read back and compared before writing**, so an unchanged spec issues
+  no Vault write and no audit-log entry on every resync. Only the keys `data`
+  declares are compared, after normalizing what Vault rewrites on read-back (a
+  `"5m"` TTL reads back as `300`); fields the spec omits are the plugin's defaults
+  and are ignored. The manager's policy therefore wants `read` on the role path
+  (plus `create`/`update`/`delete`, and `list` for pruning). Without `read` — or
+  for a plugin that does not serve role reads — the write simply happens
+  unconditionally, as it did before: correct, just not quiet.
 - Under `pruneMode: full`, a role under a *declared* `rolesPath` on a managed mount
   that is not listed here is deleted. **Limitation:** a `rolesPath` the ConfigMap
   never declares is never enumerated, so its stale roles are not pruned — vpm stays
@@ -222,6 +230,13 @@ Kubernetes RBAC** — the endpoint reads only in-process state.
 | `vpm_build_info` | gauge | `version` |
 
 Plus the standard Go runtime and process collectors.
+
+`vpm_vault_actions_total` counts writes that actually landed, not calls made:
+an `Ensure*` that finds Vault already correct records nothing, so the counter is
+**flat at steady state** and the churn alert below means what it says. Errors are
+always counted, even though no write landed — a failing attempt is the thing you
+want to see. The zero-valued series still exist from startup, so `rate()` reads
+zero rather than no data.
 
 `result="skipped"` is its own bucket, not an error: an absent or unparseable
 ConfigMap is the user's spec being wrong, not the manager being broken. A skipped

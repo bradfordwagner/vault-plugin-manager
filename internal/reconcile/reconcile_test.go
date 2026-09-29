@@ -21,14 +21,32 @@ type fakePods struct {
 	pods    []string
 	ensured []string // "pod:path"
 	removed []string // "pod:path"
+	placed  map[string]bool
 }
 
 func (f *fakePods) ListRunningPods(_ context.Context, _, _ string) ([]string, error) {
 	return f.pods, nil
 }
+
+// EnsureFile records every call but reports copied only the first time a given
+// pod+path is placed, so a second reconcile against an unchanged spec is a
+// no-op the way the real exec-copy transport is.
 func (f *fakePods) EnsureFile(_ context.Context, _, pod, _, path string, _ []byte, _, _ string) (bool, error) {
-	f.ensured = append(f.ensured, pod+":"+path)
-	return true, nil
+	key := pod + ":" + path
+	f.ensured = append(f.ensured, key)
+	return f.firstTime(key), nil
+}
+
+// firstTime reports whether key is being written for the first time.
+func (f *fakePods) firstTime(key string) bool {
+	if f.placed == nil {
+		f.placed = map[string]bool{}
+	}
+	if f.placed[key] {
+		return false
+	}
+	f.placed[key] = true
+	return true
 }
 func (f *fakePods) RemoveFile(_ context.Context, _, pod, _, path string) error {
 	f.removed = append(f.removed, pod+":"+path)
@@ -48,20 +66,40 @@ type fakeVault struct {
 	deletedRoles []string            // "mount/rolesPath/name"
 	rolesByPath  map[string][]string // existing roles keyed by "mount/rolesPath" for ListRoles
 	calls        []string            // ordered op log for cross-phase assertions
+
+	// live is what the fake Vault already holds, so the Ensure* methods report
+	// changed only on the pass that actually writes -- the real clients are
+	// read-compare-write, and a fake that always reports changed cannot catch a
+	// counter wired above the changed branch.
+	live map[string]bool
+}
+
+// wrote records key and reports whether this call is the one that wrote it.
+func (f *fakeVault) wrote(key string) bool {
+	if f.live == nil {
+		f.live = map[string]bool{}
+	}
+	if f.live[key] {
+		return false
+	}
+	f.live[key] = true
+	return true
 }
 
 func (f *fakeVault) EnsurePlugin(_ context.Context, p vault.Plugin) (bool, error) {
-	f.registered = append(f.registered, p.Name+"@"+p.Version)
-	return true, nil
+	key := p.Name + "@" + p.Version
+	f.registered = append(f.registered, key)
+	return f.wrote("plugin:" + key), nil
 }
 func (f *fakeVault) DeregisterPlugin(_ context.Context, name, _, version string) error {
 	f.deregistered = append(f.deregistered, name+"@"+version)
 	return nil
 }
 func (f *fakeVault) EnsureMount(_ context.Context, m vault.Mount) (bool, error) {
-	f.mounts = append(f.mounts, m.Type+":"+m.Path+"@"+m.Version)
+	key := m.Type + ":" + m.Path + "@" + m.Version
+	f.mounts = append(f.mounts, key)
 	f.calls = append(f.calls, "mount:"+m.Path)
-	return true, nil
+	return f.wrote("mount:" + key), nil
 }
 func (f *fakeVault) DisableMount(_ context.Context, path, mountType string) error {
 	f.disabled = append(f.disabled, mountType+":"+path)
@@ -75,11 +113,11 @@ func (f *fakeVault) ReloadPlugin(_ context.Context, name string) error {
 	f.calls = append(f.calls, "reload:"+name)
 	return nil
 }
-func (f *fakeVault) EnsureRole(_ context.Context, r vault.Role) error {
+func (f *fakeVault) EnsureRole(_ context.Context, r vault.Role) (bool, error) {
 	key := r.Mount + "/" + r.RolesPath + "/" + r.Name
 	f.ensuredRoles = append(f.ensuredRoles, key)
 	f.calls = append(f.calls, "role:"+key)
-	return nil
+	return f.wrote("role:" + key), nil
 }
 func (f *fakeVault) ListRoles(_ context.Context, mount, rolesPath string) ([]string, error) {
 	return f.rolesByPath[mount+"/"+rolesPath], nil

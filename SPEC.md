@@ -193,8 +193,12 @@ each reconcile so they change without a redeploy:
 - The alerting label combinations are pre-seeded at zero so a new pod reads as
   zero errors rather than no data. No metric is labelled by pod name (unbounded
   cardinality, worthless history).
-- Steady-state `vault_actions_total` should be flat; a persistent rate is the
-  signature of the idempotency bug class described in the version-prefix note.
+- `vault_actions_total` counts writes that landed, not calls attempted: the
+  `Ensure*` wrappers return `changed`, and `metrics.VaultActionIf` records only
+  on `changed || err != nil`. Steady state is therefore flat, and a persistent
+  rate is the signature of the idempotency bug class described in the
+  version-prefix note. Counting the attempt instead puts three actions at a
+  permanent non-zero rate and hides a real regression in that floor.
 
 Command shape: `vault-plugin-manager serve` (long-running). A `reconcile` one-shot
 subcommand is a nice-to-have for CI/debugging.

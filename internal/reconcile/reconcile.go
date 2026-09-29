@@ -30,7 +30,7 @@ type VaultOps interface {
 	DisableMount(ctx context.Context, path, mountType string) error
 	ListManagedMounts(ctx context.Context) ([]vault.ManagedMount, error)
 	ReloadPlugin(ctx context.Context, name string) error
-	EnsureRole(ctx context.Context, r vault.Role) error
+	EnsureRole(ctx context.Context, r vault.Role) (changed bool, err error)
 	ListRoles(ctx context.Context, mount, rolesPath string) ([]string, error)
 	DeleteRole(ctx context.Context, mount, rolesPath, name string) error
 }
@@ -114,7 +114,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 			Command: fileName,
 			SHA256:  res.SHA256,
 		})
-		metrics.VaultAction(metrics.ActionRegister, err)
+		metrics.VaultActionIf(metrics.ActionRegister, changed, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: registering %s@%s: %w", c.Name, c.Version, err)
 		}
@@ -142,7 +142,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 			Description: m.Config.Description,
 			Options:     m.Config.Options,
 		})
-		metrics.VaultAction(metrics.ActionMount, err)
+		metrics.VaultActionIf(metrics.ActionMount, changed, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: mount %s: %w", m.Path, err)
 		}
@@ -194,17 +194,19 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 	desiredRoles := make(map[string]map[string]map[string]bool)
 	for _, role := range spec.Roles {
 		mount := strings.Trim(role.Mount, "/")
-		err := r.vault.EnsureRole(ctx, vault.Role{
+		changed, err := r.vault.EnsureRole(ctx, vault.Role{
 			Mount:     role.Mount,
 			RolesPath: role.RolesPath,
 			Name:      role.Name,
 			Data:      role.Data,
 		})
-		metrics.VaultAction(metrics.ActionRoleUpsert, err)
+		metrics.VaultActionIf(metrics.ActionRoleUpsert, changed, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: role %s/%s/%s: %w", mount, role.RolesPath, role.Name, err)
 		}
-		r.log.With("mount", mount, "rolesPath", role.RolesPath, "role", role.Name).Debug("ensured role")
+		if changed {
+			r.log.With("mount", mount, "rolesPath", role.RolesPath, "role", role.Name).Info("wrote role")
+		}
 		if desiredRoles[mount] == nil {
 			desiredRoles[mount] = make(map[string]map[string]bool)
 		}

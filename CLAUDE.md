@@ -97,6 +97,25 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   watcher gauges are `GaugeFunc` closures over `health.State` (pull, not push),
   which is also what keeps `health` -> `metrics` from being an import cycle.
   Tests assert DELTAS: the collectors are package-level and cannot be reset.
+- **Count writes, not attempts.** Every `Ensure*` returns `changed`; record it
+  with `metrics.VaultActionIf` (records on `changed || err != nil`), never
+  `metrics.VaultAction`, which is only for call sites reached solely when work is
+  really happening (reload, and the prune loops, which `continue` past anything
+  still desired). A counter placed above the `changed` branch counts attempts,
+  which puts register/mount/role_upsert at a permanent non-zero rate, breaks the
+  "flat at steady state" reading the metric exists for, and hides a real
+  re-registration storm in its own floor. The fakes in `reconcile_test.go` model
+  `changed=false` on a repeat, and `TestReconcileSteadyStateRecordsNoVaultActions`
+  reconciles twice and requires the second pass to record nothing — keep it.
+- **Roles are read-compare-write like the other Ensure\*.** `EnsureRole`
+  (`internal/vault/roles.go`) used to write unconditionally, which was real Vault
+  traffic and real audit-log entries on every resync. The comparison is the hard
+  part: Vault normalizes on read-back (a `"5m"` TTL reads back as `300`, numbers
+  arrive as `json.Number`, omitted fields come back as plugin defaults), so
+  `roleUpToDate` compares ONLY the keys the spec declares, through the
+  duration/number normalization in `sameRoleValue`. A `reflect.DeepEqual` here
+  reports drift forever and just trades one always-on counter for another. A role
+  Vault will not serve back (read fails/unsupported) falls back to writing.
 - **Reconciler is testable.** It depends on narrow `VaultOps` / `PodOps`
   interfaces (satisfied by the real clients) and the `fetch.Fetcher` interface,
   so `reconcile_test.go` drives it with fakes — no cluster or Vault required.

@@ -299,4 +299,32 @@ fresh="$(metrics_value 'vpm_last_successful_reconcile_timestamp_seconds')"
 [[ "$fresh" -gt 0 ]] || { echo "freshness gauge never stamped"; exit 1; }
 echo "ok: freshness gauge stamped"
 
+# ...and the counters must go FLAT once converged. The counter is meant to read
+# "a steady rate means an idempotency check is missing", which only holds if a
+# no-op pass records nothing: instrumentation placed above the `changed` branch
+# counts attempts, so it climbs forever and hides a real re-registration storm
+# in its own floor. Hold the ConfigMap still for several resyncs (15s each) and
+# require the reconcile counter to move while the write counters do not.
+log "Checking the Vault action counters go flat at steady state"
+reconciles_before="$(metrics_value 'vpm_reconcile_total{result="success"')"
+register_before="$(metrics_value 'vpm_vault_actions_total{action="register",result="success"}')"
+mount_before="$(metrics_value 'vpm_vault_actions_total{action="mount",result="success"}')"
+sleep 45
+reconciles_after="$(metrics_value 'vpm_reconcile_total{result="success"')"
+register_after="$(metrics_value 'vpm_vault_actions_total{action="register",result="success"}')"
+mount_after="$(metrics_value 'vpm_vault_actions_total{action="mount",result="success"}')"
+[[ "$reconciles_after" -gt "$reconciles_before" ]] || {
+  echo "no reconcile passes ran during the steady-state window (${reconciles_before} -> ${reconciles_after}); the check proves nothing"
+  exit 1
+}
+[[ "$register_after" -eq "$register_before" ]] || {
+  echo "register counted a no-op pass: ${register_before} -> ${register_after} across $((reconciles_after - reconciles_before)) passes"
+  exit 1
+}
+[[ "$mount_after" -eq "$mount_before" ]] || {
+  echo "mount counted a no-op pass: ${mount_before} -> ${mount_after} across $((reconciles_after - reconciles_before)) passes"
+  exit 1
+}
+echo "ok: counters flat across $((reconciles_after - reconciles_before)) steady-state passes"
+
 log "E2E PASSED for Vault ${VAULT_VERSION}"
