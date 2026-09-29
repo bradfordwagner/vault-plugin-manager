@@ -56,7 +56,7 @@ Configuration is split in two:
 | `logLevel` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `stallTimeout` | `10m` | how long one reconcile pass may run before liveness fails |
 | `tokenGracePeriod` | `2m` | how long the Vault token may be invalid before readiness drops |
-| `tokenFailTimeout` | `15m` | how long the Vault token may be invalid before liveness drops |
+| `tokenFailTimeout` | `15m`, or `tokenGracePeriod` if that is larger | how long the Vault token may be invalid before liveness drops |
 | `watchGracePeriod` | `2m` | how long the ConfigMap watch may fail before readiness drops |
 
 **`pruneMode`** controls what happens when a mount or plugin version the manager
@@ -134,6 +134,13 @@ verbatim to the plugin, which owns the schema — vpm only owns *placement*.
   the first pass after a restart, which is what applies an edit made while the
   manager was down. List values compare as sets — a plugin that reorders them is
   not treated as drift, so a pure reorder of a list is not detected.
+- Mount `config.description` and `config.options` are reconciled on every pass,
+  not just at creation: editing either is applied by a tune. Only options the
+  spec declares are touched (options Vault maintains itself are left alone), and
+  an option removed from the spec is removed from the mount. A **description or
+  options edit does not reload the plugin** — only a version move does, since a
+  reload re-initializes the backend on every HA node. Mounts this manager did not
+  create keep their own description and options; only their version is pinned.
 - Under `pruneMode: full`, a role under a *declared* `rolesPath` on a managed mount
   that is not listed here is deleted. **Limitation:** a `rolesPath` the ConfigMap
   never declares is never enumerated, so its stale roles are not pruned — vpm stays
@@ -169,7 +176,13 @@ probe body carries `tokenValid`, `tokenInvalidFor`, and `tokenError`.
 
 `tokenFailTimeout` must be `>=` `tokenGracePeriod` (validated on parse): liveness
 has to outlast readiness, or the pod gets restarted before it's ever reported
-unready.
+unready. An **unset** `tokenFailTimeout` tracks the grace automatically (it is
+`max(15m, tokenGracePeriod)`), so raising `tokenGracePeriod` on its own is safe.
+Setting both, inverted, is still rejected — and note what a rejected spec costs:
+the WHOLE ConfigMap is invalid, so the manager stops reconciling catalog, mounts
+and roles, while both probes stay green (a skipped pass counts as clean). Watch
+`vpm_last_successful_reconcile_timestamp_seconds` and the `invalid configmap
+spec` error log.
 
 ### ConfigMap watcher health
 

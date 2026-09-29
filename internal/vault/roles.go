@@ -55,15 +55,15 @@ func (c *Client) EnsureRole(ctx context.Context, r Role) (changed bool, err erro
 // with exactly this set of keys, which is the precondition for trusting a
 // declared-keys-only comparison.
 func (c *Client) sameRoleKeysAsLastWrite(path string, data map[string]any) bool {
-	c.roleMu.Lock()
-	defer c.roleMu.Unlock()
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	written, ok := c.roleKeys[path]
 	return ok && written == roleKeySet(data)
 }
 
 func (c *Client) recordRoleKeys(path string, data map[string]any) {
-	c.roleMu.Lock()
-	defer c.roleMu.Unlock()
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	if c.roleKeys == nil {
 		c.roleKeys = make(map[string]string)
 	}

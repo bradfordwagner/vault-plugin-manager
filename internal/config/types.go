@@ -108,7 +108,13 @@ func (s *Settings) ApplyDefaults() {
 		s.TokenGracePeriod = Duration(DefaultTokenGracePeriod)
 	}
 	if s.TokenFailTimeout == 0 {
-		s.TokenFailTimeout = Duration(DefaultTokenFailTimeout)
+		// The default is relative to the grace, not absolute: raising
+		// tokenGracePeriod alone past 15m would otherwise fail the cross-field
+		// rule below and invalidate the WHOLE spec -- and because a skipped pass
+		// counts as clean, the manager would then stop reconciling with both
+		// probes still green. An unset liveness window always outlasts the
+		// readiness one instead.
+		s.TokenFailTimeout = Duration(max(DefaultTokenFailTimeout, s.TokenGracePeriod.Duration()))
 	}
 	if s.WatchGracePeriod == 0 {
 		s.WatchGracePeriod = Duration(DefaultWatchGracePeriod)

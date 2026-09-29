@@ -26,7 +26,7 @@ const pluginFileMode = "0755"
 type VaultOps interface {
 	EnsurePlugin(ctx context.Context, p vault.Plugin) (changed bool, err error)
 	DeregisterPlugin(ctx context.Context, name, pluginType, version string) error
-	EnsureMount(ctx context.Context, m vault.Mount) (changed bool, err error)
+	EnsureMount(ctx context.Context, m vault.Mount) (vault.MountResult, error)
 	DisableMount(ctx context.Context, path, mountType string) error
 	ListManagedMounts(ctx context.Context) ([]vault.ManagedMount, error)
 	ReloadPlugin(ctx context.Context, name string) error
@@ -134,7 +134,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 		desiredMounts[mountKey(m.Path, string(m.Type))] = true
 		desiredVersions[nvKey(m.Plugin, m.Version)] = true
 
-		changed, err := r.vault.EnsureMount(ctx, vault.Mount{
+		res, err := r.vault.EnsureMount(ctx, vault.Mount{
 			Path:        m.Path,
 			Plugin:      m.Plugin,
 			Type:        string(m.Type),
@@ -142,12 +142,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 			Description: m.Config.Description,
 			Options:     m.Config.Options,
 		})
-		metrics.VaultActionIf(metrics.ActionMount, changed, err)
+		metrics.VaultActionIf(metrics.ActionMount, res.Changed, err)
 		if err != nil {
 			return fmt.Errorf("reconcile: mount %s: %w", m.Path, err)
 		}
-		if changed {
+		if res.Changed {
 			r.log.With("mount", m.Path, "version", m.Version).Info("reconciled mount")
+		}
+		// Only a version move needs a reload: it tears down and re-initializes
+		// the backend on every HA node, which a description or options edit has
+		// no business causing.
+		if res.Reload {
 			reload[m.Plugin] = true
 		}
 	}

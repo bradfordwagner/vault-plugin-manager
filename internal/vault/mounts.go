@@ -40,24 +40,34 @@ type ManagedMount struct {
 	Version string // pinned plugin version
 }
 
-// EnsureMount enables the mount if missing, or pins it to the desired version if
-// it already exists. It returns whether a change was made.
-func (c *Client) EnsureMount(ctx context.Context, m Mount) (changed bool, err error) {
+// MountResult reports what EnsureMount did. Changed drives the metric and the
+// log line; Reload is deliberately narrower -- only the plugin VERSION behind a
+// mount requires running instances to reload, and a reload tears down and
+// re-initializes the backend on every HA node, which a description edit has no
+// business causing.
+type MountResult struct {
+	Changed bool
+	Reload  bool
+}
+
+// EnsureMount enables the mount if missing, or reconciles version, description
+// and options if it already exists.
+func (c *Client) EnsureMount(ctx context.Context, m Mount) (MountResult, error) {
 	switch m.Type {
 	case MountTypeSecret:
 		return c.ensureSecretMount(ctx, m)
 	case MountTypeAuth:
 		return c.ensureAuthMount(ctx, m)
 	default:
-		return false, fmt.Errorf("vault: unsupported mount type %q", m.Type)
+		return MountResult{}, fmt.Errorf("vault: unsupported mount type %q", m.Type)
 	}
 }
 
-func (c *Client) ensureSecretMount(ctx context.Context, m Mount) (bool, error) {
+func (c *Client) ensureSecretMount(ctx context.Context, m Mount) (MountResult, error) {
 	path := normPath(m.Path)
 	mounts, err := c.api.Sys().ListMountsWithContext(ctx)
 	if err != nil {
-		return false, fmt.Errorf("vault: listing mounts: %w", err)
+		return MountResult{}, fmt.Errorf("vault: listing mounts: %w", err)
 	}
 	existing := mounts[path+"/"]
 	if existing == nil {
@@ -67,25 +77,28 @@ func (c *Client) ensureSecretMount(ctx context.Context, m Mount) (bool, error) {
 			Options:     withManaged(m.Options),
 			Config:      api.MountConfigInput{PluginVersion: m.Version},
 		}); err != nil {
-			return false, fmt.Errorf("vault: enabling secret mount %q: %w", path, err)
+			return MountResult{}, fmt.Errorf("vault: enabling secret mount %q: %w", path, err)
 		}
-		return true, nil
+		c.recordMountOptions(m)
+		return MountResult{Changed: true, Reload: true}, nil
 	}
-	tune, drift := mountTune(existing.PluginVersion, existing.Description, existing.Options, m)
-	if !drift {
-		return false, nil
+	live := liveMount{Version: existing.PluginVersion, Description: existing.Description, Options: existing.Options}
+	tune, res := mountTune(live, m, c.mountMemory(m))
+	if !res.Changed {
+		return res, nil
 	}
 	if err := c.api.Sys().TuneMountAllowNilWithContext(ctx, path, tune); err != nil {
-		return false, fmt.Errorf("vault: tuning secret mount %q: %w", path, err)
+		return MountResult{}, fmt.Errorf("vault: tuning secret mount %q: %w", path, err)
 	}
-	return true, nil
+	c.recordMountOptions(m)
+	return res, nil
 }
 
-func (c *Client) ensureAuthMount(ctx context.Context, m Mount) (bool, error) {
+func (c *Client) ensureAuthMount(ctx context.Context, m Mount) (MountResult, error) {
 	path := normPath(m.Path)
 	auths, err := c.api.Sys().ListAuthWithContext(ctx)
 	if err != nil {
-		return false, fmt.Errorf("vault: listing auth mounts: %w", err)
+		return MountResult{}, fmt.Errorf("vault: listing auth mounts: %w", err)
 	}
 	existing := auths[path+"/"]
 	if existing == nil {
@@ -95,75 +108,143 @@ func (c *Client) ensureAuthMount(ctx context.Context, m Mount) (bool, error) {
 			Options:     withManaged(m.Options),
 			Config:      api.MountConfigInput{PluginVersion: m.Version},
 		}); err != nil {
-			return false, fmt.Errorf("vault: enabling auth mount %q: %w", path, err)
+			return MountResult{}, fmt.Errorf("vault: enabling auth mount %q: %w", path, err)
 		}
-		return true, nil
+		c.recordMountOptions(m)
+		return MountResult{Changed: true, Reload: true}, nil
 	}
-	tune, drift := mountTune(existing.PluginVersion, existing.Description, existing.Options, m)
-	if !drift {
-		return false, nil
+	live := liveMount{Version: existing.PluginVersion, Description: existing.Description, Options: existing.Options}
+	tune, res := mountTune(live, m, c.mountMemory(m))
+	if !res.Changed {
+		return res, nil
 	}
 	// Auth mounts are tuned under the "auth/" prefix.
 	if err := c.api.Sys().TuneMountAllowNilWithContext(ctx, "auth/"+path, tune); err != nil {
-		return false, fmt.Errorf("vault: tuning auth mount %q: %w", path, err)
+		return MountResult{}, fmt.Errorf("vault: tuning auth mount %q: %w", path, err)
 	}
-	return true, nil
+	c.recordMountOptions(m)
+	return res, nil
 }
 
-// mountTune builds the tune input that brings an existing mount in line with m,
-// and reports whether anything actually differs.
+// liveMount is the part of a mount Vault reports back that this manager
+// reconciles.
+type liveMount struct {
+	Version     string
+	Description string
+	Options     map[string]string
+}
+
+// mountMemory is what this process last declared for a mount, which is what
+// makes a REMOVED option detectable: an option that left the spec still sits in
+// the live map, and comparing declared keys alone can never notice it (the same
+// trap EnsureRole's key-set memory avoids). seen=false means this process has
+// not written this mount yet, so its desired state is reasserted once -- that is
+// what applies an edit made while the manager was down.
+type mountMemory struct {
+	seen        bool
+	optionsKeys map[string]bool
+}
+
+// mountTune builds the tune input that brings an existing mount in line with m.
 //
-// Version, description AND options are all reconciled. Description and options
-// are only sent on the initial enable otherwise, which made an edit to either a
-// silent no-op: the change log reported it (config.Diff emits `description` and
-// `options`), the reconcile succeeded, and Vault kept the old value forever --
-// breaking the rule that a logged change maps to the work it causes.
+// Version, description AND options are reconciled. Description and options used
+// to be sent only on the initial enable, which made an edit to either a silent
+// no-op that config.Diff nonetheless reported -- breaking the rule that a logged
+// change maps to the work it causes.
 //
-// Only the options the spec DECLARES are compared, and a tune carries the live
-// options with the declared ones merged over them. Two reasons: Vault maintains
-// options of its own on some engines (demanding an exact map would tune on every
-// pass, the same trap the role comparison avoids), and a tune that sent only the
-// declared keys would DROP the rest.
+// Description and options are reconciled ONLY on a mount this manager owns. A
+// mount that already existed at a declared path is somebody else's: pruning
+// refuses to delete it, so tuning has no business rewriting its description
+// either. Its version is still pinned, which is what the spec is really
+// declaring.
 //
-// The ownership marker is added only to a mount that already carries it. A mount
-// that exists at a declared path but was not created by this manager stays
-// unmarked, so it stays outside the prune pass -- adopting it here would make
-// somebody else's mount deletable the moment the path left the ConfigMap.
-func mountTune(existingVersion, existingDesc string, existingOpts map[string]string, m Mount) (api.TuneMountConfigInput, bool) {
+// Only the options the spec DECLARES are compared, merged over the live ones, so
+// options Vault maintains itself are neither compared (which would tune on every
+// pass) nor dropped (which sending only the declared keys would do).
+func mountTune(live liveMount, m Mount, mem mountMemory) (api.TuneMountConfigInput, MountResult) {
 	var tune api.TuneMountConfigInput
-	drift := false
+	var res MountResult
 
-	if !sameVersion(existingVersion, m.Version) {
+	if !sameVersion(live.Version, m.Version) {
 		tune.PluginVersion = &m.Version
-		drift = true
+		res.Changed = true
+		// The binary behind the mount moved, so running instances must reload.
+		res.Reload = true
 	}
-	if existingDesc != m.Description {
+	if !isManaged(live.Options) {
+		return tune, res
+	}
+
+	if live.Description != m.Description {
 		tune.Description = &m.Description
-		drift = true
+		res.Changed = true
 	}
-	if merged, changed := mergedOptions(existingOpts, m.Options); changed {
-		tune.Options = &merged
-		drift = true
+	if want, differs := desiredOptions(live.Options, m.Options, mem); differs {
+		tune.Options = &want
+		res.Changed = true
 	}
-	return tune, drift
+	// First sighting in this process: reassert the declared state once, so an
+	// edit made while the manager was down cannot be missed by a comparison that
+	// only looks at declared keys.
+	if !mem.seen && !res.Changed && (m.Description != "" || len(m.Options) > 0) {
+		desc := m.Description
+		want, _ := desiredOptions(live.Options, m.Options, mem)
+		tune.Description, tune.Options = &desc, &want
+		res.Changed = true
+	}
+	return tune, res
 }
 
-// mergedOptions overlays the declared options on the live ones, reporting
-// whether that changes anything.
-func mergedOptions(existing, declared map[string]string) (map[string]string, bool) {
-	merged := make(map[string]string, len(existing)+len(declared))
-	for k, v := range existing {
-		merged[k] = v
+// desiredOptions overlays the declared options on the live ones and drops any
+// option this process declared before but no longer does, reporting whether that
+// differs from what the mount holds now.
+func desiredOptions(live, declared map[string]string, mem mountMemory) (map[string]string, bool) {
+	want := make(map[string]string, len(live)+len(declared))
+	for k, v := range live {
+		want[k] = v
 	}
-	changed := false
-	for k, v := range declared {
-		if merged[k] != v {
-			merged[k] = v
-			changed = true
+	for k := range mem.optionsKeys {
+		if _, still := declared[k]; !still {
+			delete(want, k) // the spec dropped it; Vault's tune replaces the map
 		}
 	}
-	return merged, changed
+	for k, v := range declared {
+		want[k] = v
+	}
+	if len(want) != len(live) {
+		return want, true
+	}
+	for k, v := range want {
+		if live[k] != v {
+			return want, true
+		}
+	}
+	return want, false
 }
+
+// mountMemory returns what this process last declared for m.
+func (c *Client) mountMemory(m Mount) mountMemory {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.mountOptions[mountMemoryKey(m)]
+}
+
+// recordMountOptions remembers the option keys m declares, so a later removal is
+// detectable.
+func (c *Client) recordMountOptions(m Mount) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.mountOptions == nil {
+		c.mountOptions = make(map[string]mountMemory)
+	}
+	keys := make(map[string]bool, len(m.Options))
+	for k := range m.Options {
+		keys[k] = true
+	}
+	c.mountOptions[mountMemoryKey(m)] = mountMemory{seen: true, optionsKeys: keys}
+}
+
+func mountMemoryKey(m Mount) string { return m.Type + ":" + normPath(m.Path) }
 
 // DisableMount disables (unmounts) a secret or auth engine. A missing mount is
 // treated as success.

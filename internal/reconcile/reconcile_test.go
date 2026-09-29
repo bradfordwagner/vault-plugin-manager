@@ -67,6 +67,10 @@ type fakeVault struct {
 	rolesByPath  map[string][]string // existing roles keyed by "mount/rolesPath" for ListRoles
 	calls        []string            // ordered op log for cross-phase assertions
 
+	// mountResult, when set, replaces what EnsureMount reports, so a test can
+	// express a change that must NOT reload (description/options drift).
+	mountResult *vault.MountResult
+
 	// live is what the fake Vault already holds, so the Ensure* methods report
 	// changed only on the pass that actually writes -- the real clients are
 	// read-compare-write, and a fake that always reports changed cannot catch a
@@ -95,11 +99,17 @@ func (f *fakeVault) DeregisterPlugin(_ context.Context, name, _, version string)
 	f.deregistered = append(f.deregistered, name+"@"+version)
 	return nil
 }
-func (f *fakeVault) EnsureMount(_ context.Context, m vault.Mount) (bool, error) {
+func (f *fakeVault) EnsureMount(_ context.Context, m vault.Mount) (vault.MountResult, error) {
 	key := m.Type + ":" + m.Path + "@" + m.Version
 	f.mounts = append(f.mounts, key)
 	f.calls = append(f.calls, "mount:"+m.Path)
-	return f.wrote("mount:" + key), nil
+	// The version is part of the key, so a repeat of the same version is a
+	// no-op and a version bump both changes and reloads -- as the real client does.
+	if f.mountResult != nil {
+		return *f.mountResult, nil
+	}
+	wrote := f.wrote("mount:" + key)
+	return vault.MountResult{Changed: wrote, Reload: wrote}, nil
 }
 func (f *fakeVault) DisableMount(_ context.Context, path, mountType string) error {
 	f.disabled = append(f.disabled, mountType+":"+path)
@@ -456,5 +466,28 @@ func TestReconcileRolesNoPruneUnderNonFull(t *testing.T) {
 				t.Errorf("mode %s must not prune roles; got %v", mode, fv.deletedRoles)
 			}
 		})
+	}
+}
+
+// A reload tears down and re-initializes the backend on every HA node, so only a
+// version move triggers one. A description or options edit is a real change --
+// logged and counted -- that must leave running instances alone.
+func TestReconcileReloadsOnlyOnVersionMoves(t *testing.T) {
+	fv := &fakeVault{mountResult: &vault.MountResult{Changed: true, Reload: false}}
+	r := New(fv, &fakePods{pods: []string{"vault-0"}}, fakeFetcher{}, testConfig())
+	spec := &config.Spec{
+		Settings: config.Settings{PruneMode: config.PruneNever},
+		Mounts: []config.MountEntry{{
+			Path: "foo", Plugin: "p", Type: config.PluginTypeSecret, Version: "1.0.0",
+		}},
+	}
+	if err := r.Reconcile(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if len(fv.reloaded) != 0 {
+		t.Errorf("a mount change that needs no reload triggered one: %v", fv.reloaded)
+	}
+	if len(fv.mounts) != 1 {
+		t.Errorf("mount not reconciled; got %v", fv.mounts)
 	}
 }

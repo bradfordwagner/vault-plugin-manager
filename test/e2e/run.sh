@@ -82,10 +82,22 @@ retry() { # retry <timeout_s> <desc> <cmd...>
   echo "ok: $desc"
 }
 
+# manager_pod prints the name of the LIVE manager pod. A pod that is terminating
+# keeps status.phase=Running until its grace period expires, and rollout status
+# returns before that, so `.items[0]` can be the pod on its way out: the wrong
+# restartCount, or a podIP that stops answering seconds later. Filtering on the
+# absence of a deletionTimestamp is what makes this deterministic.
+manager_pod() {
+  kubectl -n "$NS" get pod -l app.kubernetes.io/name=vault-plugin-manager \
+    --field-selector=status.phase=Running \
+    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' \
+    | head -1
+}
+
 assert_no_restarts() { # $1 = context label
-  local restarts
-  restarts="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=vault-plugin-manager \
-    --field-selector=status.phase=Running -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')"
+  local restarts pod
+  pod="$(manager_pod)"
+  restarts="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
   if [[ "${restarts:-0}" != "0" ]]; then
     echo "FAIL: manager restarted ${restarts}x by '$1'"
     kubectl -n "$NS" describe pod -l app.kubernetes.io/name=vault-plugin-manager | sed -n '/Last State/,/Restart Count/p'
@@ -136,7 +148,11 @@ data:
       - path: e2e-http
         plugin: testplugin-http
         type: secret
-        version: "1.0.0"${oci_mount}
+        version: "1.0.0"
+        config:
+          description: "${HTTP_MOUNT_DESC:-e2e http mount}"
+          options:
+            tier: gold${oci_mount}
 EOF
 }
 
@@ -222,8 +238,8 @@ kubectl -n "$NS" rollout status "deploy/${MANAGER_DEPLOY}" --timeout=180s
 # Prove both probe endpoints actually answer 200. The manager image has no
 # shell, so the request goes from the vault pod's busybox wget (-q exits
 # non-zero on the 503 an unhealthy manager returns).
-MGR_IP="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=vault-plugin-manager \
-  --field-selector=status.phase=Running -o jsonpath='{.items[0].status.podIP}')"
+MGR_POD="$(manager_pod)"
+MGR_IP="$(kubectl -n "$NS" get pod "$MGR_POD" -o jsonpath='{.status.podIP}')"
 retry 60 "liveness probe 200"  vexec "wget -qO- http://${MGR_IP}:8080/healthz"
 retry 60 "readiness probe 200" vexec "wget -qO- http://${MGR_IP}:8080/readyz"
 # /metrics rides the same listener; assert it is routed and carries our series.
@@ -294,6 +310,27 @@ do
   [[ "$got" -gt 0 ]] || { echo "metric not recorded (still 0): $series"; exit 1; }
   echo "ok: ${series} = ${got}"
 done
+##### 10b. a description edit tunes the mount WITHOUT reloading the plugin #####
+# Description and options are reconciled, not just the version, so an edit to
+# either is applied instead of being logged and dropped. A reload, though, tears
+# down and re-initializes the backend on every HA node: only a version move may
+# cause one.
+log "Checking a description edit tunes the mount but does not reload the plugin"
+reloads_before="$(kubectl -n "$NS" logs "$(manager_pod)" --tail=-1 | grep -c "reloaded plugin" || true)"
+# Plain assignment, not an env prefix: bash keeps a prefixed assignment around a
+# FUNCTION call, so this stays explicit about the scope.
+HTTP_MOUNT_DESC="e2e http mount, retuned"
+configmap_yaml pruned | kubectl apply -f -
+retry 60 "description applied to the live mount" bash -c \
+  "kubectl -n $NS exec -i $VPOD -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault read -field=description sys/mounts/e2e-http | grep -q 'retuned'"
+reloads_after="$(kubectl -n "$NS" logs "$(manager_pod)" --tail=-1 | grep -c "reloaded plugin" || true)"
+[[ "$reloads_after" -eq "$reloads_before" ]] || {
+  echo "a description edit reloaded the plugin (${reloads_before} -> ${reloads_after})"
+  exit 1
+}
+echo "ok: description tuned, no reload"
+assert_no_restarts "after retune"
+
 # A skipped or failed pass must never stamp the freshness gauge.
 fresh="$(metrics_value 'vpm_last_successful_reconcile_timestamp_seconds')"
 [[ "$fresh" -gt 0 ]] || { echo "freshness gauge never stamped"; exit 1; }

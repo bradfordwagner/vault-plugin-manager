@@ -239,3 +239,31 @@ mounts:
 		})
 	}
 }
+
+// Raising tokenGracePeriod alone must not invalidate the whole spec. It used to:
+// the default tokenFailTimeout (15m) is below a 20m grace, the cross-field rule
+// rejected the ConfigMap, and the manager silently stopped reconciling with both
+// probes still green, because a skipped pass counts as clean.
+func TestTokenFailTimeoutDefaultsAboveTheGrace(t *testing.T) {
+	spec, err := Parse([]byte("settings:\n  tokenGracePeriod: 20m\n"))
+	if err != nil {
+		t.Fatalf("raising tokenGracePeriod alone must stay valid: %v", err)
+	}
+	if got := spec.Settings.TokenFailTimeout.Duration(); got < 20*time.Minute {
+		t.Errorf("tokenFailTimeout = %s, want >= the 20m grace", got)
+	}
+
+	// A small grace keeps the ordinary default.
+	spec, err = Parse([]byte("settings:\n  tokenGracePeriod: 1m\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Settings.TokenFailTimeout.Duration(); got != DefaultTokenFailTimeout {
+		t.Errorf("tokenFailTimeout = %s, want the %s default", got, DefaultTokenFailTimeout)
+	}
+
+	// An EXPLICIT inversion is still a mistake worth rejecting.
+	if _, err := Parse([]byte("settings:\n  tokenGracePeriod: 20m\n  tokenFailTimeout: 5m\n")); err == nil {
+		t.Error("an explicit tokenFailTimeout below the grace must be rejected")
+	}
+}

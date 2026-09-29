@@ -154,7 +154,13 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   to the work it causes". `mountTune` compares only the DECLARED options and
   merges them over the live ones, so Vault-maintained options are neither
   compared (which would tune every pass) nor dropped (which a declared-keys-only
-  tune would do).
+  tune would do); a removed option is caught by the same key-set memory as roles
+  (`mountMemory`), and description/options are reconciled ONLY on a mount that
+  carries the marker. `EnsureMount` returns `MountResult{Changed, Reload}` and
+  **only a version move sets Reload** — a reload tears down and re-initializes
+  the backend on every HA node, which a description edit must not cause. The e2e
+  covers this: it edits the description and asserts the mount is tuned while
+  `reloaded plugin` does not appear.
 - **Prune modes** (`full` | `deregister` | `never`) — documented in README and on
   the `config.PruneMode` constants. Catalog pruning only deregisters a version
   that was attached to a pruned managed mount and is no longer referenced.

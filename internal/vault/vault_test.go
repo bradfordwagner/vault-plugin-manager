@@ -109,29 +109,54 @@ func TestRenewalLead(t *testing.T) {
 // an edit that is never applied: config.Diff emits `description` and `options`
 // for mounts, and before this both were only sent on the initial enable.
 func TestMountTune(t *testing.T) {
-	managed := map[string]string{managedByKey: managedByValue}
+	managedOpts := func(extra map[string]string) map[string]string {
+		out := map[string]string{managedByKey: managedByValue}
+		for k, v := range extra {
+			out[k] = v
+		}
+		return out
+	}
+	// seen models a mount this process has already written, which is the state
+	// every pass after the first is in.
+	seen := func(keys ...string) mountMemory {
+		mem := mountMemory{seen: true, optionsKeys: map[string]bool{}}
+		for _, k := range keys {
+			mem.optionsKeys[k] = true
+		}
+		return mem
+	}
 
 	t.Run("converged mount does not tune", func(t *testing.T) {
 		m := Mount{Version: "1.0.0", Description: "github creds", Options: map[string]string{"a": "1"}}
-		opts := map[string]string{managedByKey: managedByValue, "a": "1"}
-		if _, drift := mountTune("v1.0.0", "github creds", opts, m); drift {
+		live := liveMount{Version: "v1.0.0", Description: "github creds", Options: managedOpts(map[string]string{"a": "1"})}
+		if _, res := mountTune(live, m, seen("a")); res.Changed {
 			t.Error("an unchanged mount must not be tuned")
 		}
 	})
 
-	t.Run("version bump", func(t *testing.T) {
+	t.Run("version bump reloads", func(t *testing.T) {
 		m := Mount{Version: "1.1.0"}
-		tune, drift := mountTune("v1.0.0", "", managed, m)
-		if !drift || tune.PluginVersion == nil || *tune.PluginVersion != "1.1.0" {
-			t.Errorf("want a version tune, got drift=%v tune=%+v", drift, tune)
+		live := liveMount{Version: "v1.0.0", Options: managedOpts(nil)}
+		tune, res := mountTune(live, m, seen())
+		if !res.Changed || tune.PluginVersion == nil || *tune.PluginVersion != "1.1.0" {
+			t.Errorf("want a version tune, got %+v / %+v", res, tune)
+		}
+		if !res.Reload {
+			t.Error("a version move must reload: the binary behind the mount changed")
 		}
 	})
 
-	t.Run("description edit", func(t *testing.T) {
+	// A reload tears down and re-initializes the backend on every HA node, so a
+	// cosmetic edit must not cause one.
+	t.Run("description edit does not reload", func(t *testing.T) {
 		m := Mount{Version: "1.0.0", Description: "new words"}
-		tune, drift := mountTune("v1.0.0", "old words", managed, m)
-		if !drift || tune.Description == nil || *tune.Description != "new words" {
-			t.Errorf("want a description tune, got drift=%v tune=%+v", drift, tune)
+		live := liveMount{Version: "v1.0.0", Description: "old words", Options: managedOpts(nil)}
+		tune, res := mountTune(live, m, seen())
+		if !res.Changed || tune.Description == nil || *tune.Description != "new words" {
+			t.Errorf("want a description tune, got %+v / %+v", res, tune)
+		}
+		if res.Reload {
+			t.Error("a description edit must not reload the plugin")
 		}
 		if tune.PluginVersion != nil {
 			t.Error("an unchanged version must not be sent")
@@ -140,10 +165,10 @@ func TestMountTune(t *testing.T) {
 
 	t.Run("options edit keeps what Vault maintains", func(t *testing.T) {
 		m := Mount{Version: "1.0.0", Options: map[string]string{"a": "2"}}
-		existing := map[string]string{managedByKey: managedByValue, "a": "1", "vault_owned": "keep"}
-		tune, drift := mountTune("v1.0.0", "", existing, m)
-		if !drift || tune.Options == nil {
-			t.Fatalf("want an options tune, got drift=%v tune=%+v", drift, tune)
+		live := liveMount{Version: "v1.0.0", Options: managedOpts(map[string]string{"a": "1", "vault_owned": "keep"})}
+		tune, res := mountTune(live, m, seen("a"))
+		if !res.Changed || tune.Options == nil {
+			t.Fatalf("want an options tune, got %+v / %+v", res, tune)
 		}
 		got := *tune.Options
 		if got["a"] != "2" {
@@ -157,16 +182,59 @@ func TestMountTune(t *testing.T) {
 		}
 	})
 
-	// Adopting a mount somebody else created would make it prunable the moment
-	// its path left the ConfigMap, so the marker is never added by a tune.
-	t.Run("an unmanaged mount is not adopted", func(t *testing.T) {
-		m := Mount{Version: "1.0.0", Options: map[string]string{"a": "2"}}
-		tune, drift := mountTune("v1.0.0", "", map[string]string{"a": "1"}, m)
-		if !drift || tune.Options == nil {
-			t.Fatalf("want an options tune, got drift=%v tune=%+v", drift, tune)
+	// An option that LEAVES the spec must be removed. Comparing declared keys
+	// alone can never see this: the keys that remain still match.
+	t.Run("removed option is dropped", func(t *testing.T) {
+		m := Mount{Version: "1.0.0", Options: map[string]string{"a": "1"}}
+		live := liveMount{Version: "v1.0.0", Options: managedOpts(map[string]string{"a": "1", "tier": "gold"})}
+		tune, res := mountTune(live, m, seen("a", "tier"))
+		if !res.Changed || tune.Options == nil {
+			t.Fatalf("want an options tune, got %+v / %+v", res, tune)
 		}
-		if isManaged(*tune.Options) {
-			t.Errorf("tune marked a mount this manager did not create: %v", *tune.Options)
+		if _, still := (*tune.Options)["tier"]; still {
+			t.Errorf("an option removed from the spec must be dropped: %v", *tune.Options)
+		}
+		if (*tune.Options)["a"] != "1" || !isManaged(*tune.Options) {
+			t.Errorf("removal dropped more than it should: %v", *tune.Options)
+		}
+		if res.Reload {
+			t.Error("an options edit must not reload the plugin")
+		}
+	})
+
+	// First sighting reasserts the declared state once, which is what applies an
+	// edit made while the manager was down.
+	t.Run("first sighting reasserts", func(t *testing.T) {
+		m := Mount{Version: "1.0.0", Description: "github creds", Options: map[string]string{"a": "1"}}
+		live := liveMount{Version: "v1.0.0", Description: "github creds", Options: managedOpts(map[string]string{"a": "1"})}
+		_, res := mountTune(live, m, mountMemory{})
+		if !res.Changed {
+			t.Error("the first sighting of a mount in a process must reassert its declared state")
+		}
+		if res.Reload {
+			t.Error("reasserting must not reload the plugin")
+		}
+		// ...and it goes quiet once recorded.
+		if _, res := mountTune(live, m, seen("a")); res.Changed {
+			t.Error("the reassert must not repeat on later passes")
+		}
+	})
+
+	// A mount this manager did not create is not ours to rewrite: the prune pass
+	// refuses to delete it, so tuning must not restyle it either. Its version is
+	// still pinned, which is what the spec is really declaring.
+	t.Run("a foreign mount keeps its description and options", func(t *testing.T) {
+		m := Mount{Version: "1.1.0", Description: "ours", Options: map[string]string{"a": "2"}}
+		live := liveMount{Version: "v1.0.0", Description: "theirs", Options: map[string]string{"a": "1"}}
+		tune, res := mountTune(live, m, mountMemory{})
+		if !res.Changed || tune.PluginVersion == nil {
+			t.Fatalf("want the version pinned, got %+v / %+v", res, tune)
+		}
+		if tune.Description != nil {
+			t.Errorf("tune rewrote a foreign mount's description: %q", *tune.Description)
+		}
+		if tune.Options != nil {
+			t.Errorf("tune rewrote a foreign mount's options: %v", *tune.Options)
 		}
 	})
 }

@@ -199,6 +199,9 @@ each reconcile so they change without a redeploy:
 - The alerting label combinations are pre-seeded at zero so a new pod reads as
   zero errors rather than no data. No metric is labelled by pod name (unbounded
   cardinality, worthless history).
+- A mount reconcile reports `MountResult{Changed, Reload}`: description and
+  options drift is applied like version drift, but only a version move reloads
+  the plugin, because a reload re-initializes the backend on every HA node.
 - `vault_actions_total` counts writes that landed, not calls attempted: the
   `Ensure*` wrappers return `changed`, and `metrics.VaultActionIf` records only
   on `changed || err != nil`. Steady state is therefore flat, and a persistent

@@ -131,9 +131,12 @@ func (ru *Runner) Run(ctx context.Context) error {
 	// exec, fetch, or Vault call fails the probe instead of idling silently.
 	ru.h.Heartbeat(resync + stall)
 
-	// seen is the last spec whose changes were logged, so every ConfigMap edit
-	// is reported exactly once even though the loop is level-triggered.
-	var seen *config.Spec
+	// applied is the last spec that reconciled cleanly; the change log is written
+	// against it, so an edit whose reconcile FAILS is reported again on every
+	// retry instead of scrolling away after one line. counted is the last spec
+	// observed at all, and gates the metric, so a change is counted once no
+	// matter how many times it is retried.
+	var applied, counted *config.Spec
 
 	for {
 		trigger := ""
@@ -159,14 +162,17 @@ func (ru *Runner) Run(ctx context.Context) error {
 			if lvlErr := logging.SetLevel(spec.Settings.LogLevel); lvlErr != nil {
 				ru.log.With("error", lvlErr).Warn("invalid log level in settings")
 			}
-			ru.logChanges(seen, spec, trigger)
-			seen = spec
+			ru.logChanges(applied, spec, trigger, counted)
+			counted = spec
 			metrics.SpecEntries(len(spec.Catalog), len(spec.Mounts), len(spec.Roles))
 			if err = ru.rec.Reconcile(ctx, spec); err != nil {
 				result = metrics.ResultError
 				ru.log.With("error", err).Error("reconcile failed")
 			} else {
 				result = metrics.ResultSuccess
+				// Only a clean pass advances the change log's baseline: until the
+				// work lands, the change is still pending and still worth naming.
+				applied = spec
 				ru.log.Debug("reconcile complete")
 			}
 			resync = spec.Settings.ResyncInterval.Duration()
@@ -175,7 +181,7 @@ func (ru *Runner) Run(ctx context.Context) error {
 			ru.h.SetWatchGrace(spec.Settings.WatchGracePeriod.Duration())
 		} else {
 			// Forget the spec so a ConfigMap that comes back is logged in full.
-			seen = nil
+			applied, counted = nil, nil
 		}
 		// A skipped pass is recorded but deliberately does not stamp the
 		// freshness gauge: an unparseable ConfigMap must not look like the
@@ -192,14 +198,26 @@ func (ru *Runner) Run(ctx context.Context) error {
 // reconciler then logs the work itself (copied binary, registered version,
 // reconciled mount, pruned ...), so the two together read as intent followed by
 // action. A pass with nothing new logs only at debug.
-func (ru *Runner) logChanges(old, new *config.Spec, trigger string) {
-	changes := config.Diff(old, new)
+//
+// Changes are reported against the last APPLIED spec, so a change whose
+// reconcile fails keeps being named on every retry -- otherwise the one line
+// naming the edit scrolls away and hours of "reconcile failed" say nothing about
+// which edit is being retried. They are COUNTED against the last spec merely
+// observed, so a retry does not inflate configmap_changes_total.
+func (ru *Runner) logChanges(applied, new *config.Spec, trigger string, counted *config.Spec) {
+	changes := config.Diff(applied, new)
 	if len(changes) == 0 {
 		ru.log.With("trigger", trigger).Debug("reconciling; no configmap changes")
 		return
 	}
+	newToCount := make(map[string]bool)
+	for _, c := range config.Diff(counted, new) {
+		newToCount[c.Section+"\x00"+c.Key+"\x00"+c.Action] = true
+	}
 	for _, c := range changes {
-		metrics.ConfigMapChange(c.Section, c.Action)
+		if newToCount[c.Section+"\x00"+c.Key+"\x00"+c.Action] {
+			metrics.ConfigMapChange(c.Section, c.Action)
+		}
 		ru.log.With(
 			"section", c.Section,
 			"key", c.Key,
