@@ -180,35 +180,51 @@ func TestMountTune(t *testing.T) {
 		}
 	})
 
-	// An option that LEAVES the spec must be removed. The desired set is read off
-	// the spec, not off a memory of what this process wrote, so this converges
-	// even when the edit happened while the manager was down.
-	t.Run("removed option is dropped", func(t *testing.T) {
+	// An option that LEAVES the spec must be removed, and a removal is expressed
+	// as an EMPTY VALUE: Vault's tune merges the map it is given into the stored
+	// one and deletes only the keys whose value is empty, so simply omitting the
+	// key would leave it in place -- tuning, and reloading, on every pass forever.
+	t.Run("removed option is tuned away", func(t *testing.T) {
 		m := Mount{Version: "1.0.0", Options: map[string]string{"a": "1"}}
 		live := liveMount{Version: "v1.0.0", Options: managedOpts(map[string]string{"a": "1", "tier": "gold"})}
 		tune, res := mountTune(live, m)
 		if !res.Changed || tune.Options == nil {
 			t.Fatalf("want an options tune, got %+v / %+v", res, tune)
 		}
-		if _, still := (*tune.Options)["tier"]; still {
-			t.Errorf("an option removed from the spec must be dropped: %v", *tune.Options)
+		if got, ok := (*tune.Options)["tier"]; !ok || got != "" {
+			t.Errorf("a removed option must be sent as an empty value, got %q (present=%v): %v", got, ok, *tune.Options)
 		}
 		if (*tune.Options)["a"] != "1" || !isManaged(*tune.Options) {
 			t.Errorf("removal dropped more than it should: %v", *tune.Options)
 		}
 	})
 
+	// ...and once Vault has dropped it, the mount is converged: an absent key and
+	// an empty value read the same, so the tune does not repeat (which would also
+	// reload the plugin on every pass, since options drift reloads).
+	t.Run("a settled removal does not tune again", func(t *testing.T) {
+		m := Mount{Version: "1.0.0", Options: map[string]string{"a": "1"}}
+		for _, live := range []liveMount{
+			{Version: "v1.0.0", Options: managedOpts(map[string]string{"a": "1"})},             // Vault deleted the key
+			{Version: "v1.0.0", Options: managedOpts(map[string]string{"a": "1", "tier": ""})}, // ...or emptied it
+		} {
+			if _, res := mountTune(live, m); res.Changed {
+				t.Errorf("a settled removal tuned again (options %v)", live.Options)
+			}
+		}
+	})
+
 	// The same removal, seen by a process that never wrote this mount: a restart
 	// must not resurrect the option a memory-based approach would have lost.
-	t.Run("removed option is dropped after a restart", func(t *testing.T) {
+	t.Run("removed option is tuned away after a restart", func(t *testing.T) {
 		m := Mount{Version: "1.0.0"}
 		live := liveMount{Version: "v1.0.0", Options: managedOpts(map[string]string{"tier": "gold"})}
 		tune, res := mountTune(live, m)
 		if !res.Changed || tune.Options == nil {
 			t.Fatalf("want an options tune, got %+v / %+v", res, tune)
 		}
-		if _, still := (*tune.Options)["tier"]; still {
-			t.Errorf("a fresh process wrote the stale option back: %v", *tune.Options)
+		if got, ok := (*tune.Options)["tier"]; !ok || got != "" {
+			t.Errorf("a fresh process must still clear the stale option, got %q (present=%v)", got, ok)
 		}
 		if !isManaged(*tune.Options) {
 			t.Errorf("the ownership marker must survive: %v", *tune.Options)

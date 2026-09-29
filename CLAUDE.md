@@ -158,7 +158,13 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   marker), so an option removed from the ConfigMap is removed from Vault; that is
   read off the spec rather than a memory of what this process wrote, because a
   restart wipes such a memory and reasserting from it writes the stale option
-  back. Description and options are reconciled ONLY on a mount carrying the
+  back. A removal is sent as an **empty value**: Vault's tune MERGES the map it
+  is given into the stored one and deletes only empty-valued keys, so omitting a
+  key leaves it in place — and since options reload, that would tune AND reload
+  every pass forever. An absent key and an empty value compare equal, so the
+  removal settles. `test/e2e/run.sh` removes an option and then asserts the
+  counters go flat; that is the only ground truth for Vault's actual semantics,
+  so keep it. Description and options are reconciled ONLY on a mount carrying the
   marker. `EnsureMount` returns `MountResult{Changed, Reload}`: a version move
   reloads (new binary) and an **options** change reloads (Vault hands options to
   the backend as its config at init, so a tune alone persists them without
@@ -180,6 +186,12 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   (2) Narrowing `sys/mounts/*` to per-mount paths must also grant `sys/mounts/<name>/tune`
   — `ensureSecretMount` calls `TuneMount` (`.../tune`) on version/config drift, which
   the bare `sys/mounts/<name>` path does not cover. See README "Least-privilege variant".
+- **Settings apply to the pass that reads them.** The Runner reads the spec
+  BEFORE declaring its watchdog deadline, so `stallTimeout` (and the token/watch
+  windows) govern the very first pass. Applying them a pass late meant the cold
+  start — fetch every plugin, copy to every pod, i.e. the slowest pass there is —
+  always ran against the 10m default, so raising the setting to cover it had no
+  effect until a pass had already finished: a restart loop with the fix ignored.
 - **Liveness is a watchdog, not an echo.** The manager serves no traffic, so
   `/healthz` reports on the reconcile loop: the Runner calls `Heartbeat` with its
   next deadline before each wait (`resyncInterval + stallTimeout`) and before
@@ -209,7 +221,11 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   readiness, after `watchGracePeriod`. Benign churn (EOF, 410 Gone, resource
   expired) must stay classified benign in `benignWatchError` — client-go asks for
   a randomized 5-10m watch timeout, so counting those would fire the probe
-  constantly. Any delivered event clears a recorded failure — but an event is
+  constantly. A failure EPISODE ends after silence longer than client-go's retry
+  cycle (`watchRetryCycle`, capped by the grace), NOT after the grace itself:
+  keying it to the grace merged two unrelated blips a minute apart into one
+  episode dated from the first, which unreadied a watch that had already
+  recovered. Any delivered event clears a recorded failure — but an event is
   NOT the only recovery signal, and must not be treated as one: client-go drops
   sync notifications for a listener registered with `resync=0`, so a relist of an
   UNCHANGED ConfigMap delivers nothing. Readiness therefore requires failures to

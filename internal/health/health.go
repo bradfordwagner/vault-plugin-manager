@@ -128,12 +128,16 @@ func (s *State) SetWatchGrace(d time.Duration) {
 func (s *State) WatchError(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Start a new failure EPISODE when the watch was last failing longer ago
-	// than the grace: by then client-go would have reported again if it were
-	// still broken, so this is a fresh problem and gets its own grace. Repeats
-	// INSIDE the grace deliberately leave the clock alone -- a watch failing
-	// every second must not hold the probe green by restarting it.
-	if s.watchErrorAt.IsZero() || (!s.watchLastErr.IsZero() && s.now().Sub(s.watchLastErr) > s.watchGrace) {
+	// Start a new failure EPISODE when the watch has been quiet for longer than
+	// a retry cycle: client-go retries a broken watch on a backoff capped around
+	// 30s, so silence for longer than that means the previous problem ended and
+	// this is a fresh one, which gets its own grace. The window is a RETRY cycle,
+	// not the grace: keying it to the grace merged two unrelated blips a minute
+	// apart into one episode, whose clock then started at the first blip and
+	// unreadied a watch that had already recovered. Repeats INSIDE the window
+	// deliberately leave the clock alone -- a watch failing every second must not
+	// hold the probe green by restarting it.
+	if s.watchErrorAt.IsZero() || (!s.watchLastErr.IsZero() && s.now().Sub(s.watchLastErr) > s.watchQuietWindow()) {
 		s.watchErrorAt = s.now()
 	}
 	s.watchLastErr = s.now()
@@ -150,6 +154,18 @@ func (s *State) WatchHealthy() {
 	s.watchErrorAt = time.Time{}
 	s.watchLastErr = time.Time{}
 	s.watchError = ""
+}
+
+// watchRetryCycle is how long the watch may be quiet before it counts as
+// recovered. client-go retries a failing watch on a backoff capped at ~30s, so
+// anything longer than that means nothing is failing any more.
+const watchRetryCycle = 60 * time.Second
+
+// watchQuietWindow is the silence that ends a failure episode: a retry cycle,
+// but never longer than the grace itself, so a short configured grace still
+// decides readiness. Callers hold s.mu.
+func (s *State) watchQuietWindow() time.Duration {
+	return min(watchRetryCycle, s.watchGrace)
 }
 
 // SetTokenGrace replaces the token windows from the ConfigMap's settings.
@@ -279,7 +295,7 @@ func (s *State) snapshot() report {
 	if !s.watchErrorAt.IsZero() {
 		watchDown = now.Sub(s.watchErrorAt)
 	}
-	watchFailing := !s.watchErrorAt.IsZero() && now.Sub(s.watchLastErr) <= s.watchGrace
+	watchFailing := !s.watchErrorAt.IsZero() && now.Sub(s.watchLastErr) <= s.watchQuietWindow()
 	watchReady := !watchFailing || watchDown <= s.watchGrace
 	watcherRunning := watcherErr == nil
 

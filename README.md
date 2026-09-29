@@ -137,12 +137,14 @@ verbatim to the plugin, which owns the schema — vpm only owns *placement*.
 - Mount `config.description` and `config.options` are reconciled on every pass,
   not just at creation: editing either is applied by a tune, and an option removed
   from the spec is removed from the mount (on a managed mount the declared options
-  are the whole truth). A **version or options change reloads the plugin** —
+  are the whole truth; the removal is sent to Vault as an empty value, which is
+  how its tune endpoint expresses a deletion). A **version or options change reloads the plugin** —
   Vault hands a mount's options to the backend at initialization, so without a
   reload they would be stored but not in effect — while a **description edit does
   not**, since a reload re-initializes the backend on every HA node. Mounts this
   manager did not create keep their own description and options; only their
-  version is pinned.
+  version is pinned — and a declared description or options on such a mount is
+  logged as skipped rather than silently dropped.
 - Under `pruneMode: full`, a role under a *declared* `rolesPath` on a managed mount
   that is not listed here is deleted. **Limitation:** a `rolesPath` the ConfigMap
   never declares is never enumerated, so its stale roles are not pruned — vpm stays

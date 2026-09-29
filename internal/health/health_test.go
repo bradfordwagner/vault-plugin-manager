@@ -490,3 +490,34 @@ func TestSkippedPassDoesNotOpenTheStartupGate(t *testing.T) {
 		t.Error("a skipped pass must not unready a manager that has been working")
 	}
 }
+
+// Two unrelated blips must not merge into one failure episode. An apiserver
+// rolling restart can produce a watch error, relist cleanly, and error again a
+// minute later; because the ConfigMap did not change, no event is delivered to
+// call WatchHealthy. Keying the episode boundary to the GRACE merged those into
+// one episode dated from the first blip, which then unreadied a watch that had
+// already recovered.
+func TestSeparateWatchBlipsDoNotMerge(t *testing.T) {
+	s, advance := newTestState(t)
+	s.ReconcileDone(nil)
+	s.Heartbeat(time.Hour)
+
+	s.WatchError(errors.New("connection reset")) // t=0
+	advance(90 * time.Second)
+	s.WatchError(errors.New("connection reset")) // t=90s, a fresh episode
+	advance(35 * time.Second)                    // t=125s: past the 2m grace measured from t=0
+
+	if !s.Ready() {
+		t.Fatalf("two separate blips were merged into one episode; reason=%q", s.snapshot().Reason)
+	}
+
+	// A watch that really is stuck still fails: client-go retries it on a
+	// backoff capped around 30s, so the failures keep arriving.
+	for i := 0; i < 6; i++ {
+		advance(25 * time.Second)
+		s.WatchError(errors.New("connection reset"))
+	}
+	if s.Ready() {
+		t.Error("want not ready: the watch has been failing continuously past the grace")
+	}
+}

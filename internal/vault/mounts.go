@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"vault-plugin-manager/internal/logging"
+
 	"github.com/hashicorp/vault/api"
 )
 
@@ -152,6 +154,15 @@ type liveMount struct {
 // back. The cost is that an option some future Vault sets by itself on an owned
 // mount would be cleared; the e2e declares mount options and asserts the action
 // counters stay flat, so that would surface as tune churn rather than silently.
+//
+// A removal is expressed as an EMPTY VALUE, and an empty live value reads as
+// absent, so this converges however Vault's tune handles the option map: Vault
+// MERGES a tuned map into the stored one and deletes the keys whose value is
+// empty, so simply omitting a key would leave it in place -- tuning (and, since
+// options reload, RELOADING) on every pass forever. Were it to replace the map
+// instead, the removed key would come back as an empty value, which compares
+// equal to absent. Both roads converge; the e2e removes an option and then
+// asserts the counters go flat, which is the ground truth for real Vault.
 func mountTune(live liveMount, m Mount) (api.TuneMountConfigInput, MountResult) {
 	var tune api.TuneMountConfigInput
 	var res MountResult
@@ -163,6 +174,12 @@ func mountTune(live liveMount, m Mount) (api.TuneMountConfigInput, MountResult) 
 		res.Reload = true
 	}
 	if !isManaged(live.Options) {
+		// Say so: config.Diff reports a description/options edit as intent, and
+		// without this the edit is dropped with no action log to explain it.
+		if live.Description != m.Description || len(m.Options) > 0 {
+			logging.Log().With("component", "vault", "mount", normPath(m.Path)).
+				Warn("mount was not created by this manager; leaving its description and options alone (only the version is pinned)")
+		}
 		return tune, res
 	}
 
@@ -172,7 +189,7 @@ func mountTune(live liveMount, m Mount) (api.TuneMountConfigInput, MountResult) 
 		// Deliberately NO reload: a description is metadata, and a reload tears
 		// down and re-initializes the backend on every HA node.
 	}
-	if want := withManaged(m.Options); !sameOptions(live.Options, want) {
+	if want, differs := desiredOptions(live.Options, m.Options); differs {
 		tune.Options = &want
 		res.Changed = true
 		// Options DO need one: Vault hands a mount's options to the backend as
@@ -183,17 +200,27 @@ func mountTune(live liveMount, m Mount) (api.TuneMountConfigInput, MountResult) 
 	return tune, res
 }
 
-// sameOptions reports whether two option maps are identical.
-func sameOptions(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
+// desiredOptions returns the option map to tune an owned mount with -- the
+// declared options plus the ownership marker, plus an empty value for every live
+// option the spec no longer declares, which is how Vault's tune expresses a
+// deletion -- and whether that differs from what the mount holds now.
+//
+// An absent key and an empty value compare equal, which is what makes a removal
+// settle: once Vault has dropped the key it is missing from live, and if some
+// Vault stored it as an empty value instead, that reads the same.
+func desiredOptions(live, declared map[string]string) (map[string]string, bool) {
+	want := withManaged(declared)
+	for k := range live {
+		if _, still := want[k]; !still {
+			want[k] = "" // tell Vault to drop it
 		}
 	}
-	return true
+	for k, v := range want {
+		if live[k] != v {
+			return want, true
+		}
+	}
+	return want, false
 }
 
 // DisableMount disables (unmounts) a secret or auth engine. A missing mount is

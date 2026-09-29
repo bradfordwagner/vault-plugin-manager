@@ -109,6 +109,14 @@ assert_no_restarts() { # $1 = context label
 configmap_yaml() { # $1 = full|pruned ; emits the ConfigMap
   local oci_block=""
   local oci_mount=""
+  # HTTP_MOUNT_OPTIONS=none drops the declared mount options, which is how the
+  # run exercises an option being REMOVED from the spec.
+  local http_options="
+          options:
+            tier: gold"
+  if [[ "${HTTP_MOUNT_OPTIONS:-}" == "none" ]]; then
+    http_options=""
+  fi
   if [[ "$1" == "full" ]]; then
     oci_block="
       - name: testplugin-oci
@@ -150,9 +158,7 @@ data:
         type: secret
         version: "1.0.0"
         config:
-          description: "${HTTP_MOUNT_DESC:-e2e http mount}"
-          options:
-            tier: gold${oci_mount}
+          description: "${HTTP_MOUNT_DESC:-e2e http mount}"${http_options}${oci_mount}
 EOF
 }
 
@@ -338,6 +344,23 @@ assert_no_restarts "after retune"
 fresh="$(metrics_value 'vpm_last_successful_reconcile_timestamp_seconds')"
 [[ "$fresh" -gt 0 ]] || { echo "freshness gauge never stamped"; exit 1; }
 echo "ok: freshness gauge stamped"
+
+##### 10c. an option REMOVED from the spec is removed from the mount #####
+# Vault's tune MERGES the option map it is given, deleting only the keys sent
+# with an empty value, so a removal has to be expressed rather than implied. Get
+# this wrong and the mount is tuned -- and, since options reload, the plugin
+# reloaded -- on every pass forever. Unit tests cannot settle which semantics
+# Vault has; this can.
+log "Checking an option removed from the ConfigMap is removed from the mount"
+HTTP_MOUNT_OPTIONS=none
+configmap_yaml pruned | kubectl apply -f -
+retry 60 "tier option removed from the live mount" bash -c \
+  "! kubectl -n $NS exec -i $VPOD -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault read -field=options sys/mounts/e2e-http | grep -q gold"
+# The ownership marker must survive the removal, or the mount stops being
+# prunable and silently leaves this manager's control.
+vexec 'vault read -field=options sys/mounts/e2e-http | grep -q vault-plugin-manager'
+echo "ok: option removed, ownership marker intact"
+assert_no_restarts "after option removal"
 
 # ...and the counters must go FLAT once converged. The counter is meant to read
 # "a steady rate means an idempotency check is missing", which only holds if a

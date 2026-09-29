@@ -153,6 +153,22 @@ func (ru *Runner) Run(ctx context.Context) error {
 			trigger = metrics.TriggerResync
 		}
 
+		// Read the spec BEFORE declaring the watchdog deadline: stallTimeout is a
+		// setting, and applying it a pass late means the FIRST pass -- the cold
+		// start that fetches every plugin and copies it to every Vault pod, i.e.
+		// the slowest one -- always runs against the 10m default. Raising the
+		// setting to cover it would have no effect until a pass had already
+		// completed, so a cold start slower than the default would restart-loop
+		// with the fix ignored. The token and watch windows are hoisted for the
+		// same reason.
+		spec, ok := ru.currentSpec()
+		if ok {
+			resync = spec.Settings.ResyncInterval.Duration()
+			stall = spec.Settings.StallTimeout.Duration()
+			ru.h.SetTokenGrace(spec.Settings.TokenGracePeriod.Duration(), spec.Settings.TokenFailTimeout.Duration())
+			ru.h.SetWatchGrace(spec.Settings.WatchGracePeriod.Duration())
+		}
+
 		// A pass is starting: it gets stall to finish, not the idle budget.
 		ru.h.Heartbeat(stall)
 
@@ -162,7 +178,7 @@ func (ru *Runner) Run(ctx context.Context) error {
 		var err error
 		started := time.Now()
 		result := metrics.ResultSkipped
-		if spec, ok := ru.currentSpec(); ok {
+		if ok {
 			if lvlErr := logging.SetLevel(spec.Settings.LogLevel); lvlErr != nil {
 				ru.log.With("error", lvlErr).Warn("invalid log level in settings")
 			}
@@ -179,10 +195,6 @@ func (ru *Runner) Run(ctx context.Context) error {
 				applied = spec
 				ru.log.Debug("reconcile complete")
 			}
-			resync = spec.Settings.ResyncInterval.Duration()
-			stall = spec.Settings.StallTimeout.Duration()
-			ru.h.SetTokenGrace(spec.Settings.TokenGracePeriod.Duration(), spec.Settings.TokenFailTimeout.Duration())
-			ru.h.SetWatchGrace(spec.Settings.WatchGracePeriod.Duration())
 		} else {
 			// Forget the spec so a ConfigMap that comes back is logged in full.
 			applied, counted = nil, nil
