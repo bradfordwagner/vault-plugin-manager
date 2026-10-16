@@ -23,6 +23,7 @@ from the `template_cli` / `testcli` scaffold to `vault-plugin-manager`.
 | Config schema | **Catalog + mounts split** (a plugin can back multiple mounts). |
 | Auth | Vault **Kubernetes auth method** using the manager's ServiceAccount token. |
 | Replicas | **1** (single writer). `strategy: Recreate`. Leader election is a later option if HA of the manager is ever needed. |
+| Engine config | `engineConfigs` writes `<mount>/<path>` (default `config`) from literal data plus values read from a Kubernetes Secret, **only when that content changes**. The digest of what was last written persists in a vpm-owned state Secret, so a restart does not rewrite. Removing an entry never deletes the config. |
 
 ---
 
@@ -52,7 +53,12 @@ Triggered by a ConfigMap change event **or** the periodic resync. Steps:
    - Reload via `sys/plugins/reload/backend`.
    - Tag manager-owned mounts with a marker (e.g. description/metadata
      `managed-by=vault-plugin-manager`) so pruning never touches foreign mounts.
-6. **Prune** (per mode) — mounts/versions that are manager-owned but no longer in
+6. **Write engine configs**: for each `engineConfigs` entry, build the body from
+   `data` plus the referenced Secret's values and write it to `<mount>/<path>` if
+   its digest differs from the one recorded in the state Secret (see §3a). Runs
+   after mounts and reloads (the mount must exist) and before role reconciliation
+   (a plugin may need its config before it accepts roles).
+7. **Prune** (per mode) — mounts/versions that are manager-owned but no longer in
    the ConfigMap:
    - `full`: disable mount → deregister version → `rm` binary on each pod.
    - `deregister`: disable mount → deregister version, **leave** binary on disk.
@@ -101,6 +107,16 @@ mounts:
     config:                          # mount tuning + plugin options (optional)
       description: "Foo secrets engine"
       options: {}
+
+engineConfigs:                       # plugin engine config writes (optional)
+  - mount: foo                       # references a mounts[].path
+    path: config                     # optional; default `config`; written to <mount>/<path>
+    data:                            # non-secret literal fields, written as-is
+      app_id: 4627856
+    secretRef:                       # optional; a Secret in the ConfigMap's namespace
+      name: foo-engine-credentials
+      keys:                          # <vault field>: <secret data key>
+        prv_key: private-key.pem
 ```
 
 Notes:
@@ -109,6 +125,88 @@ Notes:
 - `type: database` plugins register in the catalog but are consumed via the
   `database` secrets engine rather than a standalone mount (mount handling for
   database plugins TBD in implementation).
+
+---
+
+## 3a. Engine configs
+
+`engineConfigs` writes a plugin's own configuration endpoint (typically
+`<mount>/config`) from the ConfigMap plus a Kubernetes Secret, so credentials
+such as a GitHub App private key reach the engine without anything outside the
+cluster writing Vault engine config. The plugin owns the schema; vpm owns the
+path and the timing of the write.
+
+**Body.** The written body is `data` plus one field per `secretRef.keys` entry,
+set to that Secret data key's value as a string. vpm always writes the whole
+body, never a partial update.
+
+**Validation** (the spec is rejected as a whole, as for any other section):
+
+- `mount` is required and must reference a declared `mounts[].path`.
+- `path` defaults to `config`; surrounding slashes are trimmed, and empty, `.` or
+  `..` segments are rejected (the same rules as `roles[].rolesPath`).
+- `(mount, path)` is unique across entries.
+- At least one of `data` or `secretRef` is set. A `secretRef` needs a `name` and a
+  non-empty `keys`.
+- A Vault field may not appear in both `data` and `secretRef.keys`.
+- `path` may not equal `<rolesPath>/<name>` of a declared role on the same mount,
+  so the two sections never write one path.
+
+`roles` still rejects a role named `config`: engine config is written only
+through this section, and only on a content change.
+
+**Write on change, not on every pass.** Engine config cannot be reconciled by
+read-compare-write the way roles are: secret fields read back redacted (the
+GitHub engine returns `prv_key: <configured>`), and some engines rotate a seeded
+credential and purge the original (the Keycloak engine's `client_secret`), so a
+rewrite with the seeded value breaks them. Each pass therefore:
+
+1. Reads the state Secret (§3a "State"). NotFound means no writes are recorded.
+2. For each entry, GETs the `secretRef` Secret and builds the body. A missing
+   Secret or key fails the pass at this step, like any other reconcile error:
+   catalog and mounts have already converged, roles and pruning wait.
+3. Computes `sha256` over the canonical JSON of `{vault path, body}`. When it
+   equals the recorded digest the entry is skipped; otherwise vpm writes the body
+   to `<mount>/<path>` and records the new digest. Including the path means an
+   entry moved to a new path is written.
+4. Drops recorded digests for entries no longer in the spec, so an entry that is
+   removed and later re-added is written again.
+5. Saves the state Secret once, if it changed: an update guarded by
+   `resourceVersion`, or a create when it does not exist yet.
+
+Referenced Secrets are read on every pass, not watched: a rotated Secret value is
+applied within `resyncInterval`. A ConfigMap edit still reconciles immediately.
+
+**Ordering.** vpm writes Vault first and records the digest second. A crash, or a
+failed state save, between the two rewrites the same content on the next pass.
+That is harmless for an engine whose config is static (GitHub), and only matters
+for a rotating engine if the rotation happened inside that window.
+
+**Adoption.** An entry with no recorded digest is written on the first pass that
+sees it. Moving an already-configured engine under `engineConfigs` therefore
+overwrites its config once with the ConfigMap's values.
+
+**Pruning.** Removing an entry never deletes or rewrites the config in Vault,
+under any `pruneMode`; only its recorded digest is dropped. Engine config is not
+safely deletable in general (deleting it can strand roles and leases that depend
+on it).
+
+**State.** The state Secret (`state_secret_name`, chart default
+`<fullname>-state`) lives in the ConfigMap's namespace and is owned by vpm. It has
+one data key, `engine-configs.json`, holding a map of `<mount>/<path>` to the
+hex digest of the body last written there (Secret data keys cannot contain `/`).
+It is a Secret, not a ConfigMap, because the digests are derived from secret
+values and a short secret value can be recovered from its hash by guessing.
+Deleting an entry from it, or deleting the whole Secret, forces a rewrite on the
+next pass.
+
+**Logging and metrics.** A write logs `wrote engine config` at Info with `mount`,
+`path` and `reason` (`unrecorded` when no digest was recorded, `changed`
+otherwise), never values. It counts as the `engine_config` action through
+`metrics.VaultActionIf`, so steady state is flat. `vpm_spec_entries` carries
+`kind=engineConfigs`. The ConfigMap change log keys entries as `mount/path` and
+reports which `data` keys and which `secretRef` fields moved, never values; a
+Secret content change is not a ConfigMap change and shows up only as the write.
 
 ---
 
@@ -133,13 +231,14 @@ ConfigMap can be read:
 | `vault_container` | `vault` | container name to exec into |
 | `plugin_dir` | `/vault/plugins` | Vault `plugin_directory` path |
 | `health_addr` | `:8080` | liveness/readiness listen address; empty disables the probe server |
+| `state_secret_name` | `vault-plugin-manager-state` | vpm-owned Secret (in `configmap_namespace`) recording the digest of each engine config written (§3a) |
 
 **Runtime tunables** — live in the watched ConfigMap's `settings:` block, re-read
 each reconcile so they change without a redeploy:
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `pruneMode` | `full` | `full` \| `deregister` \| `never` (see §2 step 6) |
+| `pruneMode` | `full` | `full` \| `deregister` \| `never` (see §2 step 7) |
 | `resyncInterval` | `5m` | periodic drift reconcile |
 | `logLevel` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `stallTimeout` | `10m` | how long one reconcile pass may run before liveness calls the loop wedged |
@@ -251,6 +350,12 @@ path "sys/auth" {
 path "sys/auth/*" {
   capabilities = ["create", "read", "update", "delete", "sudo"]
 }
+
+# Engine config, one stanza per engineConfigs entry. No read: vpm never reads it
+# back (secret fields come back redacted), it compares against its own digest.
+path "github/config" {
+  capabilities = ["create", "update"]
+}
 ```
 
 Exact paths validated during implementation. Two non-obvious facts, both from Vault
@@ -272,6 +377,15 @@ Namespaced `Role` (same namespace as Vault):
 - `configmaps`: `get`, `list`, `watch`
 - `pods`: `get`, `list` (discover Vault pods)
 - `pods/exec`: `create` (copy binaries in)
+- `secrets`: `get`, `update`, scoped by `resourceNames` to the state Secret
+  (§3a). Always granted: vpm reads it every pass, so it can drop recorded digests
+  even after the last `engineConfigs` entry is removed.
+- `secrets`: `create`, only with `engineConfigs.enabled`, for the first write of
+  the state Secret. Kubernetes cannot scope `create` by name, so this lets vpm
+  create Secrets in the namespace, not read them.
+- `secrets`: `get`, only with `engineConfigs.enabled`, scoped by `resourceNames`
+  to `engineConfigs.secretNames`. A `secretRef` the chart does not list fails the
+  pass with a 403 naming the Secret.
 
 Plus the Vault-side k8s auth role binding this SA + namespace.
 
@@ -295,7 +409,9 @@ Key `values.yaml`: image repo/tag, `vault.addr`, `vault.authRole`, `vault.authMo
 `vault.podSelector`, `plugin.dir`, `resyncInterval`, `pruneMode`, `configMap.name`,
 resources, TLS settings, `health` (`enabled`, `port`, and the `livenessProbe`
 / `readinessProbe` maps, rendered verbatim so any probe field can be overridden),
-and `metrics` (`enabled`, plus a `service_monitor` block). The `metrics` keys are
+`stateSecretName` (default `<fullname>-state`), `engineConfigs` (`enabled`,
+`secretNames`; drives the Secret RBAC in §6), and `metrics` (`enabled`, plus a
+`service_monitor` block). The `metrics` keys are
 snake_case while the rest of the file is camelCase — deliberate, since converting
 the existing keys would break every current override.
 
@@ -344,3 +460,10 @@ chart/                           # Helm chart
   reconcile. Log level applies immediately (atomic-level logger); resync is
   driven by our own timer (informer resync is 0), so a changed `resyncInterval`
   takes effect on the next tick without a restart.
+- **Engine config drift is not corrected.** vpm compares against its own record
+  of what it wrote, not against Vault, so a config changed in Vault by hand stays
+  changed until the spec or Secret content changes or the recorded digest is
+  deleted from the state Secret. Secret fields read back redacted, so there is no
+  live value to compare against.
+- **Engine config crash window.** A crash between the Vault write and the state
+  save rewrites the same body on the next pass (§3a "Ordering").
