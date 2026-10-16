@@ -55,7 +55,8 @@ Triggered by a ConfigMap change event **or** the periodic resync. Steps:
      `managed-by=vault-plugin-manager`) so pruning never touches foreign mounts.
 6. **Write engine configs**: for each `engineConfigs` entry, build the body from
    `data` plus the referenced Secret's values and write it to `<mount>/<path>` if
-   its digest differs from the one recorded in the state Secret (see §3a). Runs
+   its digest or its mount's UUID differs from the record in the state Secret
+   (see §3a). Runs
    after mounts and reloads (the mount must exist) and before role reconciliation
    (a plugin may need its config before it accepts roles).
 7. **Prune** (per mode) — mounts/versions that are manager-owned but no longer in
@@ -142,15 +143,20 @@ body, never a partial update.
 
 **Validation** (the spec is rejected as a whole, as for any other section):
 
-- `mount` is required and must reference a declared `mounts[].path`.
+- `mount` is required and must reference a declared `mounts[]` entry of
+  `type: secret`. The request path is `<mount>/<path>`; auth methods keep their
+  config under `auth/<mount>/...`, which this section does not address, so a
+  reference to an auth mount is rejected.
 - `path` defaults to `config`; surrounding slashes are trimmed, and empty, `.` or
   `..` segments are rejected (the same rules as `roles[].rolesPath`).
 - `(mount, path)` is unique across entries.
 - At least one of `data` or `secretRef` is set. A `secretRef` needs a `name` and a
   non-empty `keys`.
 - A Vault field may not appear in both `data` and `secretRef.keys`.
-- `path` may not equal `<rolesPath>/<name>` of a declared role on the same mount,
-  so the two sections never write one path.
+- `path` may not equal, or sit under, any `rolesPath` declared on the same mount.
+  Role pruning under `pruneMode: full` lists every declared `rolesPath` and
+  deletes what the spec does not name, so an engine config there would be deleted
+  as an undeclared role. This also keeps the two sections from writing one path.
 
 `roles` still rejects a role named `config`: engine config is written only
 through this section, and only on a content change.
@@ -162,17 +168,26 @@ credential and purge the original (the Keycloak engine's `client_secret`), so a
 rewrite with the seeded value breaks them. Each pass therefore:
 
 1. Reads the state Secret (§3a "State"). NotFound means no writes are recorded.
-2. For each entry, GETs the `secretRef` Secret and builds the body. A missing
-   Secret or key fails the pass at this step, like any other reconcile error:
-   catalog and mounts have already converged, roles and pruning wait.
-3. Computes `sha256` over the canonical JSON of `{vault path, body}`. When it
-   equals the recorded digest the entry is skipped; otherwise vpm writes the body
-   to `<mount>/<path>` and records the new digest. Including the path means an
-   entry moved to a new path is written.
-4. Drops recorded digests for entries no longer in the spec, so an entry that is
-   removed and later re-added is written again.
-5. Saves the state Secret once, if it changed: an update guarded by
-   `resourceVersion`, or a create when it does not exist yet.
+2. Resolves every entry before writing any: GETs each `secretRef` Secret and
+   builds the body. A missing Secret or key fails the pass here, with nothing
+   written, like any other reconcile error: catalog and mounts have already
+   converged, roles and pruning wait.
+3. Reads the live UUID of each referenced mount from `sys/mounts`. Vault assigns a
+   new UUID whenever a mount is enabled, so a mount that was disabled and
+   re-enabled (by vpm or anyone else) is recognizable even though its path is not.
+4. For each entry, computes `sha256` over the canonical JSON of
+   `{vault path, body}`. When both the digest and the mount UUID equal the
+   recorded ones the entry is skipped; otherwise vpm writes the body to
+   `<mount>/<path>` and records the new digest and UUID. Including the path means
+   an entry moved to a new path is written; comparing the UUID means a recreated
+   mount, whose config went with it, is written.
+5. Drops records for entries no longer in the spec, so an entry that is removed
+   and later re-added is written again.
+6. Saves the state Secret whenever the step leaves it changed, **including when a
+   later entry's write fails**: every write that landed is checkpointed before the
+   error is returned, so one failing entry cannot make the others rewrite on every
+   pass. The save is an update guarded by `resourceVersion`, or a create when the
+   Secret does not exist yet. A failed save is returned alongside any write error.
 
 Referenced Secrets are read on every pass, not watched: a rotated Secret value is
 applied within `resyncInterval`. A ConfigMap edit still reconciles immediately.
@@ -182,31 +197,32 @@ failed state save, between the two rewrites the same content on the next pass.
 That is harmless for an engine whose config is static (GitHub), and only matters
 for a rotating engine if the rotation happened inside that window.
 
-**Adoption.** An entry with no recorded digest is written on the first pass that
-sees it. Moving an already-configured engine under `engineConfigs` therefore
-overwrites its config once with the ConfigMap's values.
+**Adoption.** An entry with no record is written on the first pass that sees it.
+Moving an already-configured engine under `engineConfigs` therefore overwrites
+its config once with the ConfigMap's values.
 
 **Pruning.** Removing an entry never deletes or rewrites the config in Vault,
-under any `pruneMode`; only its recorded digest is dropped. Engine config is not
-safely deletable in general (deleting it can strand roles and leases that depend
-on it).
+under any `pruneMode`; only its record is dropped. Engine config is not safely
+deletable in general (deleting it can strand roles and leases that depend on it).
 
 **State.** The state Secret (`state_secret_name`, chart default
 `<fullname>-state`) lives in the ConfigMap's namespace and is owned by vpm. It has
-one data key, `engine-configs.json`, holding a map of `<mount>/<path>` to the
-hex digest of the body last written there (Secret data keys cannot contain `/`).
-It is a Secret, not a ConfigMap, because the digests are derived from secret
-values and a short secret value can be recovered from its hash by guessing.
-Deleting an entry from it, or deleting the whole Secret, forces a rewrite on the
-next pass.
+one data key, `engine-configs.json`, holding a map of `<mount>/<path>` to
+`{"sha256": "<hex digest of the body last written>", "mountUUID": "<uuid of the
+mount it was written to>"}` (Secret data keys cannot contain `/`, so the records
+share one key). It is a Secret, not a ConfigMap, because the digests are derived
+from secret values and a short secret value can be recovered from its hash by
+guessing. Deleting a record from it, or deleting the whole Secret, forces a
+rewrite on the next pass.
 
 **Logging and metrics.** A write logs `wrote engine config` at Info with `mount`,
-`path` and `reason` (`unrecorded` when no digest was recorded, `changed`
-otherwise), never values. It counts as the `engine_config` action through
-`metrics.VaultActionIf`, so steady state is flat. `vpm_spec_entries` carries
-`kind=engineConfigs`. The ConfigMap change log keys entries as `mount/path` and
-reports which `data` keys and which `secretRef` fields moved, never values; a
-Secret content change is not a ConfigMap change and shows up only as the write.
+`path` and `reason` (`unrecorded` when there was no record, `mount_recreated`
+when the mount UUID moved, `changed` otherwise), never values. It counts as the
+`engine_config` action through `metrics.VaultActionIf`, so steady state is flat.
+`vpm_spec_entries` carries `kind=engineConfigs`. The ConfigMap change log keys
+entries as `mount/path` and reports which `data` keys and which `secretRef`
+fields moved, never values; a Secret content change is not a ConfigMap change and
+shows up only as the write.
 
 ---
 
@@ -461,9 +477,9 @@ chart/                           # Helm chart
   driven by our own timer (informer resync is 0), so a changed `resyncInterval`
   takes effect on the next tick without a restart.
 - **Engine config drift is not corrected.** vpm compares against its own record
-  of what it wrote, not against Vault, so a config changed in Vault by hand stays
-  changed until the spec or Secret content changes or the recorded digest is
-  deleted from the state Secret. Secret fields read back redacted, so there is no
+  of what it wrote, not against Vault. A recreated mount is caught by its UUID,
+  but a config edited in place in Vault stays edited until the spec or Secret
+  content changes or its record is deleted from the state Secret. Secret fields read back redacted, so there is no
   live value to compare against.
 - **Engine config crash window.** A crash between the Vault write and the state
   save rewrites the same body on the next pass (§3a "Ordering").
