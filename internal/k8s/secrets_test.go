@@ -101,6 +101,15 @@ func TestPutSecretDataUpdateSendsSuppliedResourceVersion(t *testing.T) {
 	if got.ResourceVersion != "7" || !reflect.DeepEqual(got.Data, data) {
 		t.Fatalf("unexpected updated secret: %+v", got)
 	}
+	if got.Name != "state" || got.Namespace != "vault" {
+		t.Errorf("name/namespace = %s/%s, want vault/state", got.Namespace, got.Name)
+	}
+	if got.Type != corev1.SecretTypeOpaque {
+		t.Errorf("type = %q, want %q", got.Type, corev1.SecretTypeOpaque)
+	}
+	if v := got.Labels["app.kubernetes.io/managed-by"]; v != "vault-plugin-manager" {
+		t.Errorf("managed-by label = %q, want vault-plugin-manager", v)
+	}
 }
 
 func TestPutSecretDataUpdateConflictIsReturned(t *testing.T) {
