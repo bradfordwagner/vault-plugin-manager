@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -360,6 +361,14 @@ func TestEngineConfigErrorsAreScrubbedOfSecretValues(t *testing.T) {
 			pem: "abc", tok: "abcdef", errText: "abcdef",
 			want: "<redacted>", absent: []string{"def"},
 		},
+		"json without html escaping": {
+			pem: `a"b<&>`, tok: "zzz", errText: `bad value a\"b<&>`,
+			want: "<redacted>", absent: []string{`a\"b<&>`, "b<&>"},
+		},
+		"strconv quoted": {
+			pem: "a\ab", tok: "zzz", errText: "bad value " + strconv.Quote("a\ab")[1:5],
+			want: "bad value <redacted>", absent: []string{`\a`},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -397,6 +406,8 @@ func TestScrubSecrets(t *testing.T) {
 		"overlapping values":           {values: []string{"abc", "cdef"}, in: "xabcdefy", want: "x<redacted>y"},
 		"one value contains the other": {values: []string{"abc", "abcdef"}, in: "abcdef", want: "<redacted>"},
 		"json escaped":                 {values: []string{`a"b`}, in: `v=a\"b.`, want: "v=<redacted>."},
+		"json without html escaping":   {values: []string{`a"b<&>`}, in: `v=a\"b<&>.`, want: "v=<redacted>."},
+		"strconv quoted":               {values: []string{"a\ab"}, in: `v=a\ab.`, want: "v=<redacted>."},
 		"separate runs":                {values: []string{"k"}, in: "k-k", want: "<redacted>-<redacted>"},
 		"value overlaps itself":        {values: []string{"aba"}, in: "ababa", want: "<redacted>"},
 		"no secret in the error":       {values: []string{"KEY1"}, in: "vault: HTTP 400", want: "vault: HTTP 400"},
@@ -487,6 +498,10 @@ func stateDoc(doc string) map[string][]byte {
 }
 
 func TestEngineConfigMountUUIDsValidatedBeforeAnyWrite(t *testing.T) {
+	wantDetail := map[string]string{
+		"mount absent":     "is not a live secret mount",
+		"empty mount uuid": "reports an empty UUID",
+	}
 	cases := map[string]func(u map[string]string){
 		"mount absent":     func(u map[string]string) { delete(u, "other") },
 		"empty mount uuid": func(u map[string]string) { u["other"] = "" },
@@ -502,8 +517,8 @@ func TestEngineConfigMountUUIDsValidatedBeforeAnyWrite(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected an error for the unusable mount UUID")
 			}
-			if !strings.Contains(err.Error(), "other") {
-				t.Errorf("error %q does not name the mount", err)
+			if want := `mount "other" ` + wantDetail[name]; !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not contain %q", err, want)
 			}
 			if len(g.fv.configWrites) != 0 {
 				t.Errorf("writes = %v, want none", g.fv.configWrites)
@@ -611,6 +626,30 @@ func TestEngineConfigNoEntriesNoStateSecretIsNoop(t *testing.T) {
 	}
 	if got := g.secrets.gets[testConfig().StateSecretName]; got != 1 {
 		t.Errorf("state Secret read %d times, want once per pass", got)
+	}
+}
+
+func TestEngineConfigNoEntriesDoesNotListMountUUIDs(t *testing.T) {
+	g := newECRig(nil)
+	g.mustPass(t, ecSpec(t, config.PruneNever, ""))
+	if has(g.fv.calls, "uuids") {
+		t.Errorf("SecretMountUUIDs was called with no entries; calls=%v", g.fv.calls)
+	}
+}
+
+func TestEngineConfigWriteAndSaveErrorsAreBothReported(t *testing.T) {
+	g := newECRig(map[string][]byte{"pem": []byte("KEY1")})
+	g.secrets.secrets[testConfig().StateSecretName] = stateDoc(`{}`)
+	g.secrets.putErr = errors.New("apiserver unavailable")
+	g.fv.writeErr = map[string]error{"other/config": errors.New("HTTP 500")}
+	err := g.pass(ecSpec(t, config.PruneNever, ecGithubAndOther))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"engine config other/config", "HTTP 500", "saving engine config state Secret", "apiserver unavailable"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
 	}
 }
 

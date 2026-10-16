@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -293,7 +295,7 @@ func engineConfigDigest(path string, body map[string]any) (string, error) {
 }
 
 // scrubSecrets returns err's text with every occurrence of each value, raw or
-// JSON-escaped, replaced. Every byte covered by any occurrence is masked first
+// escaped as a quoted string, replaced. Every byte covered by any occurrence is masked first
 // and each maximal masked run becomes one marker, so overlapping or nested
 // values leave no fragment behind. The result is a new error that does not
 // unwrap to the original.
@@ -330,16 +332,30 @@ func scrubSecrets(err error, values []string) error {
 	return errors.New(b.String())
 }
 
-// secretPatterns is v and, when it differs, v as it appears inside a JSON string.
+// secretPatterns is v and each distinct form it takes inside a quoted string:
+// json.Marshal's (HTML-escaped), the same without HTML escaping, and
+// strconv.Quote's.
 func secretPatterns(v string) []string {
 	if v == "" {
 		return nil
 	}
 	out := []string{v}
-	if raw, err := json.Marshal(v); err == nil {
-		if esc := string(raw[1 : len(raw)-1]); esc != v {
-			out = append(out, esc)
+	add := func(form string) {
+		if !slices.Contains(out, form) {
+			out = append(out, form)
 		}
 	}
+	if raw, err := json.Marshal(v); err == nil {
+		add(string(raw[1 : len(raw)-1]))
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err == nil {
+		raw := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+		add(string(raw[1 : len(raw)-1]))
+	}
+	q := strconv.Quote(v)
+	add(q[1 : len(q)-1])
 	return out
 }

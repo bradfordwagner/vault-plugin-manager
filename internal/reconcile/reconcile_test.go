@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
 	"testing"
 
@@ -147,11 +148,8 @@ func (f *fakeVault) DeleteRole(_ context.Context, mount, rolesPath, name string)
 }
 
 func (f *fakeVault) SecretMountUUIDs(_ context.Context) (map[string]string, error) {
-	out := make(map[string]string, len(f.uuids))
-	for k, v := range f.uuids {
-		out[k] = v
-	}
-	return out, nil
+	f.calls = append(f.calls, "uuids")
+	return maps.Clone(f.uuids), nil
 }
 func (f *fakeVault) WriteEngineConfig(_ context.Context, path string, body map[string]any) error {
 	f.calls = append(f.calls, "config:"+path)
@@ -162,11 +160,7 @@ func (f *fakeVault) WriteEngineConfig(_ context.Context, path string, body map[s
 	if f.configBodies == nil {
 		f.configBodies = map[string]map[string]any{}
 	}
-	cp := make(map[string]any, len(body))
-	for k, v := range body {
-		cp[k] = v
-	}
-	f.configBodies[path] = cp
+	f.configBodies[path] = maps.Clone(body)
 	return nil
 }
 
