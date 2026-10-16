@@ -357,6 +357,29 @@ func TestParseValidEngineConfigs(t *testing.T) {
 	}
 }
 
+func TestParseEngineConfigTargetsPathMountedAsAuthAndSecret(t *testing.T) {
+	raw := engineConfigBase + `
+  - path: both
+    plugin: a
+    type: auth
+    version: "1"
+  - path: both
+    plugin: p
+    type: secret
+    version: "1"
+engineConfigs:
+  - mount: both
+    data: {a: 1}
+`
+	s, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("a path mounted as auth and secret should accept engineConfigs: %v", err)
+	}
+	if len(s.EngineConfigs) != 1 {
+		t.Fatalf("got engineConfigs=%d, want 1", len(s.EngineConfigs))
+	}
+}
+
 func TestParseInvalidEngineConfigs(t *testing.T) {
 	const ok = "    data: {a: 1}\n"
 	cases := map[string]struct {
@@ -371,6 +394,9 @@ func TestParseInvalidEngineConfigs(t *testing.T) {
 			[]string{"duplicate"},
 		},
 		"neither data nor secretRef": {"engineConfigs:\n  - mount: github\n", []string{"one of data or secretRef"}},
+		"empty data no secretRef":    {"engineConfigs:\n  - mount: github\n    data: {}\n", []string{"one of data or secretRef"}},
+		"secretRef empty field name": {"engineConfigs:\n  - mount: github\n    secretRef: {name: s, keys: {\"\": pem}}\n", []string{"engineConfigs[0]", "empty Vault field name"}},
+		"secretRef empty data key":   {"engineConfigs:\n  - mount: github\n    secretRef: {name: s, keys: {prv_key: \"\"}}\n", []string{"engineConfigs[0]", "prv_key", "empty Secret data key"}},
 		"secretRef without name":     {"engineConfigs:\n  - mount: github\n    secretRef: {keys: {a: b}}\n", []string{"secretRef.name is required"}},
 		"secretRef empty keys":       {"engineConfigs:\n  - mount: github\n    secretRef: {name: s}\n", []string{"secretRef.keys"}},
 		"field in data and keys": {

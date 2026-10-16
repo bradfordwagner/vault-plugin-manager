@@ -219,6 +219,48 @@ func TestDiffEngineConfigsChangedReportsKeysNotValues(t *testing.T) {
 	}
 }
 
+func TestDiffEngineConfigsAddedSecretRefOnlyOmitsDataKeys(t *testing.T) {
+	s := mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    secretRef: {name: creds, keys: {prv_key: pem}}\n")
+	for _, c := range Diff(nil, s) {
+		if c.Section != SectionEngineConfigs {
+			continue
+		}
+		if strings.Contains(c.Detail, "data keys") {
+			t.Errorf("detail %q mentions data keys for a secretRef-only entry", c.Detail)
+		}
+		if want := "secretRef creds fields: prv_key"; c.Detail != want {
+			t.Errorf("detail %q, want %q", c.Detail, want)
+		}
+		return
+	}
+	t.Fatal("no engineConfigs change")
+}
+
+func TestDiffEngineConfigsSecretRefAddedAndRemoved(t *testing.T) {
+	const withRef = "    secretRef: {name: creds, keys: {prv_key: pem}}\n"
+	plain := mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    data: {a: 1}\n")
+	ref := mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    data: {a: 1}\n"+withRef)
+	cases := []struct {
+		name     string
+		old, new *Spec
+		want     string
+	}{
+		{"added", plain, ref, "secretRef added: creds fields: prv_key"},
+		{"removed", ref, plain, "secretRef removed: creds"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Diff(tc.old, tc.new)
+			if len(got) != 1 || got[0].Section != SectionEngineConfigs || got[0].Action != ActionChanged {
+				t.Fatalf("got %v, want one engineConfigs changed", got)
+			}
+			if got[0].Detail != tc.want {
+				t.Errorf("detail %q, want %q", got[0].Detail, tc.want)
+			}
+		})
+	}
+}
+
 func TestDiffEngineConfigsRemoved(t *testing.T) {
 	old := mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    data: {a: 1}\n")
 	got := Diff(old, mustParse(t, engineConfigDiffBase))

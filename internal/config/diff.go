@@ -40,13 +40,13 @@ func (c Change) String() string {
 }
 
 // Diff reports how new differs from old, in the order the reconcile loop acts:
-// settings, catalog, mounts, engineConfigs, roles. Entries are identified by the same keys the
-// reconciler uses, so a change maps to the work it causes:
+// settings, catalog, mounts, engineConfigs, roles. Entries are identified by
+// the same keys the reconciler uses, so a change maps to the work it causes:
 //
-//	catalog  name@version   (versions coexist, so a bump is a remove + an add)
-//	mounts   type:path
+//	catalog        name@version   (versions coexist, so a bump is a remove + an add)
+//	mounts         type:path
 //	engineConfigs  mount/path
-//	roles    mount/rolesPath/name
+//	roles          mount/rolesPath/name
 //
 // A nil old means "nothing seen yet": every entry reports as added and settings
 // report only where they differ from the defaults. Diff never mutates its
@@ -243,11 +243,14 @@ func engineConfigKey(e EngineConfigEntry) string {
 
 // engineConfigSummary names the fields an entry sets without their values.
 func engineConfigSummary(e EngineConfigEntry) string {
-	s := "data keys: " + joinKeys(e.Data)
-	if e.SecretRef != nil {
-		s += fmt.Sprintf(", secretRef %s fields: %s", e.SecretRef.Name, joinKeys(e.SecretRef.Keys))
+	var parts []string
+	if len(e.Data) > 0 {
+		parts = append(parts, "data keys: "+joinKeys(e.Data))
 	}
-	return s
+	if e.SecretRef != nil {
+		parts = append(parts, fmt.Sprintf("secretRef %s fields: %s", e.SecretRef.Name, joinKeys(e.SecretRef.Keys)))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func engineConfigDetail(o, n EngineConfigEntry) string {

@@ -134,7 +134,7 @@ func (s *Spec) validateEngineConfigs(mountTypes map[string]map[PluginType]bool) 
 			}
 		}
 
-		if e.Data == nil && e.SecretRef == nil {
+		if len(e.Data) == 0 && e.SecretRef == nil {
 			return fmt.Errorf("engineConfigs[%d] (%s): one of data or secretRef is required", i, e.Mount)
 		}
 		if ref := e.SecretRef; ref != nil {
@@ -150,6 +150,12 @@ func (s *Spec) validateEngineConfigs(mountTypes map[string]map[PluginType]bool) 
 			}
 			sort.Strings(fields)
 			for _, field := range fields {
+				switch {
+				case field == "":
+					return fmt.Errorf("engineConfigs[%d] (%s): secretRef.keys has an empty Vault field name", i, e.Mount)
+				case ref.Keys[field] == "":
+					return fmt.Errorf("engineConfigs[%d] (%s): secretRef.keys field %q has an empty Secret data key", i, e.Mount, field)
+				}
 				if _, dup := e.Data[field]; dup {
 					return fmt.Errorf("engineConfigs[%d] (%s): field %q is set in both data and secretRef.keys", i, e.Mount, field)
 				}
