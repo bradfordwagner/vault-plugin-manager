@@ -43,3 +43,10 @@ configMap:
   create: false
   name: vault-plugins
   key: plugins.yaml
+
+# The run writes e2e-http/config from literal data plus the e2e-engine-creds
+# Secret, which run.sh creates before the manager starts.
+engineConfigs:
+  enabled: true
+  secretNames:
+    - e2e-engine-creds
