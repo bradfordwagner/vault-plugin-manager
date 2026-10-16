@@ -148,7 +148,11 @@ JSON-encodable: quote anything YAML would read as a timestamp.
   malformed or `null` JSON, or has a record without both fields. It also fails when
   a referenced Secret or key is missing, or a value is empty or not valid UTF-8, or
   a referenced mount is not a live secret mount. A field whose real value is the
-  empty string goes in `data`, not a Secret.
+  empty string goes in `data`, not a Secret. With no `engineConfigs` entries, an
+  unusable state Secret only logs a warning and the step is skipped.
+- **The state Secret is created before the first write.** When it does not exist
+  and an entry needs a write, the manager creates it (holding `{}`) before writing
+  Vault, so a Secret it cannot create fails the pass with nothing written.
 - **Errors never carry Secret values.** A failed Vault write reports only the path
   and HTTP status (the response body is withheld, since a plugin may echo what it
   was sent), and any other error from this step is scrubbed of the Secret values it
@@ -158,9 +162,10 @@ JSON-encodable: quote anything YAML would read as a timestamp.
 - **Forcing a rewrite:** delete the entry's record from the state Secret, or the
   whole Secret. Fix or delete a Secret the manager rejects as malformed.
 - **Writes are at least once.** The manager writes Vault first and records the
-  digest second, so a crash between the two, a failed state save, or a write that
-  errored after Vault accepted it causes one more write on a later pass. Harmless
-  for static config; a rotating engine is reseeded with the ConfigMap's values.
+  digest second, so after a crash between the two, a failed state save, or a write
+  that errored after Vault accepted it, the write is retried on later passes until
+  the save lands. Harmless for static config; a rotating engine is reseeded with
+  the ConfigMap's values.
   A mount that already holds config is overwritten once when its entry is first
   added.
 
@@ -357,8 +362,8 @@ Every reconcile logs **what changed in the ConfigMap** before the reconciler log
 **what it did about it**. Changes are keyed the way the reconciler keys them, so a
 line maps to the work it causes: `name@version` for catalog entries (versions
 coexist, so a bump reads as a remove plus an add), `type:path` for mounts, and
-`mount/rolesPath/name` for roles, and `mount/path` for engine configs (which
-`data` keys and `secretRef` fields moved, never values).
+`mount/rolesPath/name` for roles, and `mount/path` for engine configs, which
+report the `data` keys and `secretRef` fields that moved, never values.
 
 ```
 INFO  configmap change: catalog foo@1.1.0 added: type=secret, url=https://…/foo.tar.gz  section=catalog key=foo@1.1.0 action=added
@@ -479,12 +484,22 @@ The manager's ServiceAccount needs, in the Vault namespace:
 - `pods`: `get`, `list`
 - `pods/exec`: `create`
 - `secrets`: `get`, `update` on the state Secret only (`resourceNames`)
-- with `engineConfigs.enabled`: `secrets` `create` (to make the state Secret on the
-  first write; Kubernetes cannot scope `create` by name) and `get` on each Secret
-  in `engineConfigs.secretNames`
+- with `engineConfigs.enabled`: `secrets` `create` (to make the state Secret before
+  the first write; Kubernetes cannot scope `create` by name) and `get` on each
+  Secret in `engineConfigs.secretNames`
 
 These are rendered by the Helm chart (`rbac.create=true`). A `secretRef` naming a
 Secret that is not in `engineConfigs.secretNames` fails the pass with a 403.
+
+### Upgrading
+
+Every pass reads the state Secret named by `STATE_SECRET_NAME` in
+`CONFIGMAP_NAMESPACE`. The chart grants `get`/`update` on it automatically, in the
+release namespace. With `rbac.create=false`, or a ConfigMap outside the release
+namespace, grant `secrets` `get`,`update` on that Secret yourself, plus `create`
+and `get` on the referenced Secrets to use `engineConfigs`. Without
+`engineConfigs` entries an unreadable state Secret only logs a warning; with
+entries it fails the pass.
 
 ## Helm chart
 

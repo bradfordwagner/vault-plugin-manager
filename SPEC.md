@@ -162,7 +162,7 @@ body, never a partial update.
   with the field named. Quote the value to keep it a string.
 
 `roles` still rejects a role named `config`: engine config is written only
-through this section, and only on a content change.
+through this section.
 
 **Write on change, not on every pass.** Engine config cannot be reconciled by
 read-compare-write the way roles are: secret fields read back redacted (the
@@ -175,10 +175,13 @@ rewrite with the seeded value breaks them. Each pass therefore:
    apiserver down), a Secret without the `engine-configs.json` key, JSON that does
    not decode, a `null` document or `null` record, or a record missing its digest
    or mount UUID fails the pass here, with nothing written. `{}` is valid empty
-   state. Treating any of these as empty state would rewrite every
-   entry from the ConfigMap, reseeding credentials a rotating engine has already
-   replaced. The way out is to fix the Secret or delete it, which is an explicit
-   request for a rewrite.
+   state. Treating any of these as empty state would rewrite every entry from the
+   ConfigMap, reseeding credentials a rotating engine has already replaced. The
+   way out is to fix the Secret or delete it, which is an explicit request for a
+   rewrite. When the spec declares no entries there is nothing to protect, so any
+   of these outcomes logs one Warn naming the state Secret and skips the step
+   without saving; roles and pruning still run. NotFound with no entries is a
+   quiet no-op.
 2. Resolves every entry before writing any: GETs each distinct `secretRef` Secret
    once per pass, and every entry resolves from that snapshot. A missing Secret or
    key fails the pass here, with nothing written, like any other reconcile error:
@@ -197,27 +200,37 @@ rewrite with the seeded value breaks them. Each pass therefore:
    recorded ones the entry is skipped; otherwise vpm writes the body to
    `<mount>/<path>` and records the new digest and UUID. Including the path means
    an entry moved to a new path is written; comparing the UUID means a recreated
-   mount, whose config went with it, is written.
+   mount, whose config went with it, is written. When the state Secret does not
+   exist and at least one entry needs a write, vpm first creates it holding `{}`
+   and writes Vault only after the create succeeds. A create that fails (no
+   `create` RBAC, a `count/secrets` quota, an admission webhook) fails the pass
+   with nothing written, so a state Secret vpm cannot create never turns into a
+   rewrite of Vault on every pass with nothing recorded. With no write pending,
+   nothing is created.
 5. Drops records for entries no longer in the spec, so an entry that is removed
    and later re-added is written again.
 6. Saves the state Secret whenever the step leaves it changed, **including when a
    later entry's write fails**: every write that landed is checkpointed before the
    error is returned, so one failing entry cannot make the others rewrite on every
-   pass. The save is an update guarded by `resourceVersion`, or a create when the
-   Secret does not exist yet. A failed save is returned alongside any write error.
+   pass. The save is an update guarded by `resourceVersion`; the Secret exists by
+   then, since step 4 creates a missing one before the first write. A failed save
+   is returned alongside any write error.
 
 Referenced Secrets are read on every pass, not watched: a rotated Secret value is
 applied within `resyncInterval`. A ConfigMap edit still reconciles immediately.
 
 **Ordering and delivery.** vpm writes Vault first and records the digest second,
 so writes are **at least once, not exactly once**. Three cases rewrite content
-Vault may already hold on the next pass:
+Vault may already hold, on each later pass until the save lands:
 
 - a crash between the Vault write and the state save;
 - a failed state save;
 - a write that returns an error but landed anyway (a client timeout or dropped
   connection after Vault accepted it). vpm cannot tell this from a write that
   failed, so it records nothing and the next pass writes again.
+
+A state Secret that cannot be created is not one of them: the create precedes
+the first write, so the pass fails before Vault is touched.
 
 A rewrite is harmless for an engine whose config is static (GitHub). For a
 rotating engine it reseeds the original credential if the engine rotated before
@@ -250,10 +263,10 @@ when the mount UUID moved, `changed` otherwise), never values. It counts as the
 A failed Vault write reports only the path and the HTTP status, never Vault's
 response body: a plugin may echo, partially or transformed, the values it was
 sent. Every other error from the step is scrubbed of the resolved Secret values
-before it is returned or logged. `vpm_spec_entries` carries `kind=engineConfigs`. The ConfigMap change log keys
-entries as `mount/path` and reports which `data` keys and which `secretRef`
-fields moved, never values; a Secret content change is not a ConfigMap change and
-shows up only as the write.
+before it is returned or logged. `vpm_spec_entries` carries
+`kind=engineConfigs`. The ConfigMap change log keys entries as `mount/path` and
+reports which `data` keys and which `secretRef` fields moved, never values; a
+Secret content change is not a ConfigMap change and shows up only as the write.
 
 ---
 
@@ -510,8 +523,9 @@ chart/                           # Helm chart
 - **Engine config drift is not corrected.** vpm compares against its own record
   of what it wrote, not against Vault. A recreated mount is caught by its UUID,
   but a config edited in place in Vault stays edited until the spec or Secret
-  content changes or its record is deleted from the state Secret. Secret fields read back redacted, so there is no
-  live value to compare against.
+  content changes or its record is deleted from the state Secret. Secret fields
+  read back redacted, so there is no live value to compare against.
 - **Engine config writes are at least once.** A crash or failed state save after
   the Vault write, or a write whose error hides that Vault accepted it, rewrites
-  the same body on the next pass (§3a "Ordering and delivery").
+  the same body on later passes until the save lands (§3a "Ordering and
+  delivery").

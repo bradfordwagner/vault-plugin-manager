@@ -25,7 +25,7 @@ rules:
     verbs: ["get", "update"]
     resourceNames: [{{ include "vault-plugin-manager.stateSecretName" . | quote }}]
   {{- if .Values.engineConfigs.enabled }}
-  # Create the state Secret on the first engine config write (create cannot be scoped by name).
+  # Create the state Secret before the first engine config write (create cannot be scoped by name).
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create"]

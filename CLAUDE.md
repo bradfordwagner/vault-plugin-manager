@@ -133,11 +133,16 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   Read-back cannot be compared: secret fields come back redacted and rotating
   engines replace the seeded credential, so a rewrite breaks them. State reads fail
   closed on anything but NotFound (read error, missing key, bad or `null` JSON,
-  incomplete record), because treating them as empty rewrites every entry. Every
+  incomplete record), because treating them as empty rewrites every entry, except
+  with zero entries declared, where an unusable state Secret logs one Warn and
+  skips the step so a deployment without engine configs keeps reconciling. Every
   Secret is read once per pass, empty or non-UTF-8 values fail the pass, and every
-  mount UUID is checked before any write. Writes checkpoint the state even when a
-  later entry fails, so one bad entry does not rewrite the rest every pass. Removal
-  drops the record and never deletes or rewrites Vault, under any `pruneMode`.
+  mount UUID is checked before any write. A missing state Secret is created before
+  the first Vault write, so one that cannot be created fails the pass with nothing
+  written instead of rewriting Vault every pass. Writes checkpoint the state even
+  when a later entry fails, so one bad entry does not rewrite the rest every pass.
+  Removal drops the record and never deletes or rewrites Vault, under any
+  `pruneMode`.
   Errors are scrubbed of resolved Secret values and a failed Vault write carries
   only path and status (`internal/vault/engineconfig.go`); never log values.
   `roles` still rejects `config`, so the two sections cannot write one path.

@@ -91,7 +91,7 @@ stateSecretName: ""
 
 engineConfigs:
   # When true, the Role also grants `create` on Secrets (to make the state Secret
-  # on the first engine config write) and `get` on each of secretNames. Leave
+  # before the first engine config write) and `get` on each of secretNames. Leave
   # false if the spec declares no engineConfigs.
   enabled: false
   # Names of the Secrets that spec.engineConfigs[].secretRef.name points at. The
@@ -142,9 +142,10 @@ configMap:
     catalog: []
     mounts: []
     # engineConfigs: write a plugin's config endpoint (<mount>/<path>) from
-    # literal `data` plus values read from a Secret in this namespace, only when
-    # that content changes. The Secret must also be listed in the chart value
-    # engineConfigs.secretNames so the manager may read it.
+    # literal `data` plus values read from a Secret in the ConfigMap's
+    # namespace, only when that content changes. The Secret must also be listed
+    # in the chart value engineConfigs.secretNames, which the Role in the release
+    # namespace grants `get` on, so the manager may read it.
     #
     #   engineConfigs:
     #     - mount: example              # references a mounts[].path
