@@ -153,6 +153,9 @@ func validate(a args.ServeArgs) error {
 	if a.ConfigMapName == "" {
 		missing = append(missing, "configmap_name")
 	}
+	if a.StateSecretName == "" {
+		missing = append(missing, "state_secret_name")
+	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required configuration: %s", strings.Join(missing, ", "))
 	}
