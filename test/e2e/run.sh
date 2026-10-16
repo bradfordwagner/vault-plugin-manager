@@ -447,8 +447,10 @@ engine_field_is app_id 42 || { echo "app_id lost on rotation"; exit 1; }
 log "Checking a recreated mount gets its engine config back"
 vexec 'vault secrets disable e2e-http'
 retry 120 "engine config rewritten after the mount was recreated" engine_field_is prv_key KEY2
-retry 60 "mount_recreated write logged" bash -c \
-  "kubectl -n $NS logs $(manager_pod) --tail=-1 | grep 'wrote engine config' | grep -Eq 'reason\"?[:=] ?\"?mount_recreated'"
+recreate_logged() {
+  [[ "$(kubectl -n "$NS" logs "$(manager_pod)" --tail=-1 | grep 'wrote engine config' | { grep -Ec 'reason"?[:=] ?"?mount_recreated' || true; })" -gt 0 ]]
+}
+retry 60 "mount_recreated write logged" recreate_logged
 assert_no_restarts "after mount recreation"
 
 log "Checking a manager restart does not rewrite an unchanged engine config"
@@ -470,21 +472,25 @@ rewrites="$(kubectl -n "$NS" logs "$MGR_POD" --tail=-1 | { grep -c 'wrote engine
 echo "ok: restart left the engine config alone"
 
 log "Checking removing the entry leaves the config in Vault"
+read_engine_state() {
+  kubectl -n "$NS" get secret "${MANAGER_DEPLOY}-state" -o jsonpath='{.data.engine-configs\.json}' | base64 -d
+}
+state_json="$(read_engine_state)"
+grep -q '"e2e-http/config"' <<<"$state_json" || { echo "state Secret does not record e2e-http/config before the removal: $state_json"; exit 1; }
 ENGINE_CONFIG=none
 configmap_yaml pruned | kubectl apply -f -
-retry 60 "entry removal logged" bash -c \
-  "kubectl -n $NS logs $MGR_POD --tail=-1 | grep -q 'configmap change: engineConfigs'"
+removal_logged() {
+  [[ "$(kubectl -n "$NS" logs "$MGR_POD" --tail=-1 | { grep -c 'configmap change: engineConfigs' || true; })" -gt 0 ]]
+}
+retry 60 "entry removal logged" removal_logged
 passes="$(metrics_value 'vpm_reconcile_total{result="success"')"
 passed_again() {
   [[ "$(metrics_value 'vpm_reconcile_total{result="success"')" -ge $((passes + 2)) ]]
 }
 retry 90 "successful reconciles after the removal" passed_again
 engine_field_is prv_key manual || { echo "removing the entry changed the config: prv_key is '$(read_engine_field prv_key)'"; exit 1; }
-state_json="$(kubectl -n "$NS" get secret "${MANAGER_DEPLOY}-state" -o jsonpath='{.data.engine-configs\.json}' | base64 -d)"
-if grep -q 'e2e-http/config' <<<"$state_json"; then
-  echo "state Secret still records the removed entry: $state_json"
-  exit 1
-fi
+state_json="$(read_engine_state)"
+[[ "$state_json" == "{}" ]] || { echo "state Secret is not empty after the removal: $state_json"; exit 1; }
 echo "ok: removal left the config in Vault and dropped the state record"
 assert_no_restarts "after engine config removal"
 
