@@ -95,3 +95,48 @@ func TestWriteEngineConfigErrorOmitsResponseBody(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteEngineConfigStatusDecidesTheOutcome(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		wantErr bool
+	}{
+		{"404 whitespace body", http.StatusNotFound, " \n", true},
+		{"404 empty body", http.StatusNotFound, "", true},
+		{"404 unparseable body", http.StatusNotFound, "not json SECRET-PEM", true},
+		{"404 mistyped data", http.StatusNotFound, `{"data":"SECRET-PEM"}`, true},
+		{"500 errors body", http.StatusInternalServerError, `{"errors":["SECRET-PEM"]}`, true},
+		{"204 no body", http.StatusNoContent, "", false},
+		{"200 whitespace body", http.StatusOK, " \n", false},
+		{"200 unparseable body", http.StatusOK, "not json", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := engineConfigClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			err := c.WriteEngineConfig(context.Background(), "github/config", map[string]any{"prv_key": "SECRET-PEM"})
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("expected success, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			msg := err.Error()
+			if want := "HTTP " + strconv.Itoa(tc.status); !strings.Contains(msg, want) {
+				t.Errorf("error %q missing %q", msg, want)
+			}
+			for _, bad := range []string{"SECRET-PEM", "invalid character", "unmarshal", "EOF"} {
+				if strings.Contains(msg, bad) {
+					t.Errorf("error %q carries response-derived text %q", msg, bad)
+				}
+			}
+		})
+	}
+}

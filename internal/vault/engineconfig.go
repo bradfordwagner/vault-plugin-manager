@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -22,17 +23,36 @@ func (c *Client) SecretMountUUIDs(ctx context.Context) (map[string]string, error
 }
 
 // WriteEngineConfig writes body to path (already "<mount>/<path>", no leading
-// slash). A plugin's 4xx response can echo the submitted values, and reconcile
-// errors are logged verbatim, so an API error carries only the path and status
-// code and wraps nothing that could unwrap back to the response body.
+// slash). A plugin's error response can echo the submitted values, and
+// reconcile errors are logged verbatim, so the response body is never read:
+// the HTTP status alone decides the outcome, and an error carries only the path
+// and status. The raw write matters for correctness too: the secret-parsing
+// write reports a 404 whose body is only whitespace as success, which would
+// record a write Vault never accepted.
 func (c *Client) WriteEngineConfig(ctx context.Context, path string, body map[string]any) error {
-	_, err := c.api.Logical().WriteWithContext(ctx, normPath(path), body)
-	if err == nil {
-		return nil
+	data, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("vault: encoding engine config %s: %w", path, err)
+	}
+	resp, err := c.api.Logical().WriteRawWithContext(ctx, normPath(path), data)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
 	}
 	var respErr *api.ResponseError
 	if errors.As(err, &respErr) {
-		return fmt.Errorf("vault: writing engine config %s: HTTP %d (response body withheld; it may echo secret values)", path, respErr.StatusCode)
+		status = respErr.StatusCode
 	}
-	return fmt.Errorf("vault: writing engine config %s: %w", path, err)
+	switch {
+	case status != 0 && (status < 200 || status > 299):
+		return fmt.Errorf("vault: writing engine config %s: HTTP %d (response body withheld; it may echo secret values)", path, status)
+	case err != nil:
+		return fmt.Errorf("vault: writing engine config %s: %w", path, err)
+	case resp == nil:
+		return fmt.Errorf("vault: writing engine config %s: no response", path)
+	}
+	return nil
 }
