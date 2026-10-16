@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -188,6 +189,16 @@ mounts:
 	}
 }
 
+func TestParseRoleNamedConfigPointsAtEngineConfigs(t *testing.T) {
+	_, err := Parse([]byte(engineConfigBase + "roles:\n  - mount: github\n    name: config\n"))
+	if err == nil {
+		t.Fatal("expected an error for a role named config")
+	}
+	if !strings.Contains(err.Error(), "reserved") || !strings.Contains(err.Error(), "engineConfigs") {
+		t.Errorf("error %q does not say config is reserved for engineConfigs", err)
+	}
+}
+
 func TestParseInvalid(t *testing.T) {
 	cases := map[string]string{
 		"missing source": `
@@ -265,5 +276,160 @@ func TestTokenFailTimeoutDefaultsAboveTheGrace(t *testing.T) {
 	// An EXPLICIT inversion is still a mistake worth rejecting.
 	if _, err := Parse([]byte("settings:\n  tokenGracePeriod: 20m\n  tokenFailTimeout: 5m\n")); err == nil {
 		t.Error("an explicit tokenFailTimeout below the grace must be rejected")
+	}
+}
+
+const engineConfigBase = `
+catalog:
+  - name: p
+    type: secret
+    version: "1"
+    source: {url: https://x}
+  - name: a
+    type: auth
+    version: "1"
+    source: {url: https://x}
+mounts:
+  - path: github
+    plugin: p
+    type: secret
+    version: "1"
+  - path: other
+    plugin: p
+    type: secret
+    version: "1"
+  - path: authonly
+    plugin: a
+    type: auth
+    version: "1"
+`
+
+func TestParseValidEngineConfigs(t *testing.T) {
+	cases := map[string]struct {
+		raw       string
+		wantMount string
+		wantPath  string
+	}{
+		"path omitted defaults to config": {
+			raw:       "engineConfigs:\n  - mount: github\n    data: {app_id: 1}\n",
+			wantMount: "github", wantPath: "config",
+		},
+		"path slashes are trimmed": {
+			raw:       "engineConfigs:\n  - mount: /github/\n    path: /config/\n    data: {app_id: 1}\n",
+			wantMount: "github", wantPath: "config",
+		},
+		"data only": {
+			raw:       "engineConfigs:\n  - mount: github\n    path: realm/x/config\n    data: {app_id: 1}\n",
+			wantMount: "github", wantPath: "realm/x/config",
+		},
+		"secretRef only": {
+			raw:       "engineConfigs:\n  - mount: github\n    secretRef: {name: creds, keys: {prv_key: pem}}\n",
+			wantMount: "github", wantPath: "config",
+		},
+		"roles path on a different mount": {
+			raw:       "roles:\n  - mount: other\n    name: r\nengineConfigs:\n  - mount: github\n    path: roles/bootstrap\n    data: {a: 1}\n",
+			wantMount: "github", wantPath: "roles/bootstrap",
+		},
+		"path beside the default rolesPath": {
+			raw:       "roles:\n  - mount: github\n    name: r\nengineConfigs:\n  - mount: github\n    path: rolesX\n    data: {a: 1}\n",
+			wantMount: "github", wantPath: "rolesX",
+		},
+		"github shape": {
+			raw: "roles:\n  - mount: github\n    name: r\n    rolesPath: permissionset\n" +
+				"engineConfigs:\n  - mount: github\n    data: {app_id: 1}\n    secretRef: {name: creds, keys: {prv_key: pem}}\n",
+			wantMount: "github", wantPath: "config",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, err := Parse([]byte(engineConfigBase + tc.raw))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(s.EngineConfigs) != 1 {
+				t.Fatalf("got engineConfigs=%d, want 1", len(s.EngineConfigs))
+			}
+			e := s.EngineConfigs[0]
+			if e.Mount != tc.wantMount || e.Path != tc.wantPath {
+				t.Errorf("got mount=%q path=%q, want mount=%q path=%q", e.Mount, e.Path, tc.wantMount, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestParseEngineConfigTargetsPathMountedAsAuthAndSecret(t *testing.T) {
+	raw := engineConfigBase + `
+  - path: both
+    plugin: a
+    type: auth
+    version: "1"
+  - path: both
+    plugin: p
+    type: secret
+    version: "1"
+engineConfigs:
+  - mount: both
+    data: {a: 1}
+`
+	s, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("a path mounted as auth and secret should accept engineConfigs: %v", err)
+	}
+	if len(s.EngineConfigs) != 1 {
+		t.Fatalf("got engineConfigs=%d, want 1", len(s.EngineConfigs))
+	}
+}
+
+func TestParseInvalidEngineConfigs(t *testing.T) {
+	const ok = "    data: {a: 1}\n"
+	cases := map[string]struct {
+		raw  string
+		want []string
+	}{
+		"missing mount":   {"engineConfigs:\n  - path: config\n" + ok, []string{"engineConfigs[0]: mount is required"}},
+		"unknown mount":   {"engineConfigs:\n  - mount: nope\n" + ok, []string{`references unknown mount "nope"`}},
+		"auth mount only": {"engineConfigs:\n  - mount: authonly\n" + ok, []string{"secret mounts only"}},
+		"duplicate": {
+			"engineConfigs:\n  - mount: github\n    path: config\n" + ok + "  - mount: /github\n    path: /config\n" + ok,
+			[]string{"duplicate"},
+		},
+		"neither data nor secretRef": {"engineConfigs:\n  - mount: github\n", []string{"one of data or secretRef"}},
+		"empty data no secretRef":    {"engineConfigs:\n  - mount: github\n    data: {}\n", []string{"one of data or secretRef"}},
+		"secretRef empty field name": {"engineConfigs:\n  - mount: github\n    secretRef: {name: s, keys: {\"\": pem}}\n", []string{"engineConfigs[0]", "empty Vault field name"}},
+		"secretRef empty data key":   {"engineConfigs:\n  - mount: github\n    secretRef: {name: s, keys: {prv_key: \"\"}}\n", []string{"engineConfigs[0]", "prv_key", "empty Secret data key"}},
+		"secretRef without name":     {"engineConfigs:\n  - mount: github\n    secretRef: {keys: {a: b}}\n", []string{"secretRef.name is required"}},
+		"secretRef empty keys":       {"engineConfigs:\n  - mount: github\n    secretRef: {name: s}\n", []string{"secretRef.keys"}},
+		"field in data and keys": {
+			"engineConfigs:\n  - mount: github\n    data: {prv_key: x}\n    secretRef: {name: s, keys: {prv_key: pem}}\n",
+			[]string{"prv_key", "both"},
+		},
+		"path empty segment": {"engineConfigs:\n  - mount: github\n    path: a//b\n" + ok, []string{`path "a//b" must not contain an empty segment`}},
+		"path dotdot":        {"engineConfigs:\n  - mount: github\n    path: ..\n" + ok, []string{`path ".." must not contain a ".." segment`}},
+		"path only slash":    {"engineConfigs:\n  - mount: github\n    path: /\n" + ok, []string{`path "/" must not be empty after trimming slashes`}},
+		"path equals rolesPath": {
+			"roles:\n  - mount: github\n    name: r\n    rolesPath: permissionset\nengineConfigs:\n  - mount: github\n    path: permissionset\n" + ok,
+			[]string{"rolesPath"},
+		},
+		"path under rolesPath": {
+			"roles:\n  - mount: github\n    name: r\nengineConfigs:\n  - mount: github\n    path: roles/bootstrap\n" + ok,
+			[]string{"rolesPath"},
+		},
+		"nan":           {"engineConfigs:\n  - mount: github\n    data: {x: .nan}\n", []string{"data", "x"}},
+		"inf":           {"engineConfigs:\n  - mount: github\n    data: {x: .inf}\n", []string{"data", "x"}},
+		"unquoted date": {"engineConfigs:\n  - mount: github\n    data: {created: 2001-12-14}\n", []string{"created", "quote"}},
+		"nested nan":    {"engineConfigs:\n  - mount: github\n    data: {opts: {deep: .nan}}\n", []string{"opts"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(engineConfigBase + tc.raw))
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q does not contain %q", err, w)
+				}
+			}
+		})
 	}
 }

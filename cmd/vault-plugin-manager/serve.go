@@ -25,6 +25,7 @@ func init() {
 	flag_helper.CreateFlag(fs, &serveArgs.ConfigMapName, "configmap_name", "", "", "ConfigMap to watch (env CONFIGMAP_NAME)")
 	flag_helper.CreateFlag(fs, &serveArgs.ConfigMapNamespace, "configmap_namespace", "", "", "Namespace of the watched ConfigMap; defaults to own namespace (env CONFIGMAP_NAMESPACE)")
 	flag_helper.CreateFlag(fs, &serveArgs.ConfigMapKey, "configmap_key", "", "plugins.yaml", "ConfigMap data key holding the plugin spec (env CONFIGMAP_KEY)")
+	flag_helper.CreateFlag(fs, &serveArgs.StateSecretName, "state_secret_name", "", "vault-plugin-manager-state", "vpm-owned Secret recording engine config writes (env STATE_SECRET_NAME)")
 
 	// Vault pod discovery + exec-copy
 	flag_helper.CreateFlag(fs, &serveArgs.VaultPodSelector, "vault_pod_selector", "", "app.kubernetes.io/name=vault", "Label selector for Vault pods (env VAULT_POD_SELECTOR)")

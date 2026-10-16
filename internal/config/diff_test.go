@@ -149,3 +149,142 @@ func assertLines(t *testing.T, got, want []string) {
 		}
 	}
 }
+
+const engineConfigDiffBase = `
+catalog:
+  - name: p
+    type: secret
+    version: "1"
+    source: {url: https://x}
+mounts:
+  - path: github
+    plugin: p
+    type: secret
+    version: "1"
+`
+
+func TestDiffEngineConfigsAdded(t *testing.T) {
+	s := mustParse(t, engineConfigDiffBase+`
+engineConfigs:
+  - mount: github
+    data: {app_id: 4627856}
+    secretRef: {name: creds, keys: {prv_key: pem}}
+`)
+	var got []Change
+	for _, c := range Diff(nil, s) {
+		if c.Section == SectionEngineConfigs {
+			got = append(got, c)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d engineConfigs changes, want 1: %v", len(got), got)
+	}
+	c := got[0]
+	if c.Key != "github/config" || c.Action != ActionAdded {
+		t.Errorf("got key=%q action=%q", c.Key, c.Action)
+	}
+	for _, want := range []string{"app_id", "creds", "prv_key"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("detail %q missing %q", c.Detail, want)
+		}
+	}
+	if strings.Contains(c.Detail, "4627856") {
+		t.Errorf("detail %q leaks a data value", c.Detail)
+	}
+}
+
+func TestDiffEngineConfigsChangedReportsKeysNotValues(t *testing.T) {
+	mk := func(appID, secret, field string) *Spec {
+		return mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    data: {app_id: "+appID+"}\n"+
+			"    secretRef: {name: "+secret+", keys: {prv_key: "+field+"}}\n")
+	}
+	detail := func(old, new *Spec) string {
+		t.Helper()
+		got := Diff(old, new)
+		if len(got) != 1 || got[0].Section != SectionEngineConfigs || got[0].Action != ActionChanged {
+			t.Fatalf("got %v, want one engineConfigs changed", got)
+		}
+		return got[0].Detail
+	}
+
+	d := detail(mk("1", "a", "pem"), mk("2", "a", "pem"))
+	if !strings.Contains(d, "data keys: app_id") || strings.ContainsAny(d, "12") {
+		t.Errorf("detail %q", d)
+	}
+	if d := detail(mk("1", "a", "pem"), mk("1", "b", "pem")); !strings.Contains(d, "secretRef name a -> b") {
+		t.Errorf("detail %q", d)
+	}
+	if d := detail(mk("1", "a", "pem"), mk("1", "a", "key")); !strings.Contains(d, "secretRef fields: prv_key") {
+		t.Errorf("detail %q", d)
+	}
+}
+
+func TestDiffEngineConfigsAddedSecretRefOnlyOmitsDataKeys(t *testing.T) {
+	s := mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    secretRef: {name: creds, keys: {prv_key: pem}}\n")
+	for _, c := range Diff(nil, s) {
+		if c.Section != SectionEngineConfigs {
+			continue
+		}
+		if strings.Contains(c.Detail, "data keys") {
+			t.Errorf("detail %q mentions data keys for a secretRef-only entry", c.Detail)
+		}
+		if want := "secretRef creds fields: prv_key"; c.Detail != want {
+			t.Errorf("detail %q, want %q", c.Detail, want)
+		}
+		return
+	}
+	t.Fatal("no engineConfigs change")
+}
+
+func TestDiffEngineConfigsSecretRefAddedAndRemoved(t *testing.T) {
+	const withRef = "    secretRef: {name: creds, keys: {prv_key: pem}}\n"
+	plain := mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    data: {a: 1}\n")
+	ref := mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    data: {a: 1}\n"+withRef)
+	cases := []struct {
+		name     string
+		old, new *Spec
+		want     string
+	}{
+		{"added", plain, ref, "secretRef added: creds fields: prv_key"},
+		{"removed", ref, plain, "secretRef removed: creds"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Diff(tc.old, tc.new)
+			if len(got) != 1 || got[0].Section != SectionEngineConfigs || got[0].Action != ActionChanged {
+				t.Fatalf("got %v, want one engineConfigs changed", got)
+			}
+			if got[0].Detail != tc.want {
+				t.Errorf("detail %q, want %q", got[0].Detail, tc.want)
+			}
+		})
+	}
+}
+
+func TestDiffEngineConfigsRemoved(t *testing.T) {
+	old := mustParse(t, engineConfigDiffBase+"engineConfigs:\n  - mount: github\n    data: {a: 1}\n")
+	got := Diff(old, mustParse(t, engineConfigDiffBase))
+	want := []Change{{SectionEngineConfigs, "github/config", ActionRemoved, "config left in Vault"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestDiffEngineConfigsOrderedAfterMountsBeforeRoles(t *testing.T) {
+	s := mustParse(t, engineConfigDiffBase+`
+roles:
+  - mount: github
+    name: r
+engineConfigs:
+  - mount: github
+    data: {a: 1}
+`)
+	var sections []string
+	for _, c := range Diff(nil, s) {
+		sections = append(sections, c.Section)
+	}
+	want := []string{SectionCatalog, SectionMounts, SectionEngineConfigs, SectionRoles}
+	if strings.Join(sections, ",") != strings.Join(want, ",") {
+		t.Errorf("sections = %v, want %v", sections, want)
+	}
+}

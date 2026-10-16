@@ -33,3 +33,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "vault-plugin-manager.configMapNamespace" -}}
 {{- default .Release.Namespace .Values.configMap.namespace -}}
 {{- end -}}
+
+{{- define "vault-plugin-manager.stateSecretName" -}}
+{{- default (printf "%s-state" (include "vault-plugin-manager.fullname" .)) .Values.stateSecretName -}}
+{{- end -}}

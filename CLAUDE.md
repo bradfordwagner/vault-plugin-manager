@@ -54,11 +54,14 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   (`client.go`), catalog (`catalog.go`), mounts (`mounts.go`), reload (`reload.go`).
 - `internal/k8s/` — clientset (`client.go`), pod discovery + exec-copy transport
   (`pods.go`), ConfigMap informer (`informer.go`, which returns the informer so
-  the probes can interrogate it).
+  the probes can interrogate it), Secret get/put for the state Secret and
+  `secretRef` reads (`secrets.go`).
 - `internal/fetch/` — the `Fetcher`: HTTPS + archive extraction (`http.go`), OCI
   via go-containerregistry (`oci.go`), sha256 verify (`fetch.go`).
 - `internal/reconcile/` — the idempotent, level-triggered loop (`reconcile.go`)
   and the informer/timer `Runner` (`runner.go`).
+- `internal/reconcile/engineconfig.go`: the engine config step (state Secret records,
+  Secret resolution, scrubbed errors).
 - `internal/health/` — liveness/readiness probe server (`health.go`): a watchdog
   `State` the reconcile Runner heartbeats, served on `HEALTH_ADDR`. Its mux also
   mounts `/metrics`.
@@ -123,6 +126,26 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   made while the manager was down). Lists compare as MULTISETS, and a declared
   empty list equals a `null` read-back — plugins that store list fields as sets
   reorder them, and an index-by-index compare would rewrite the role forever.
+- **Engine config is write-on-change, never read-compare-write.**
+  `reconcileEngineConfigs` (`internal/reconcile/engineconfig.go`) writes an entry
+  only when the state Secret's record (`engine-configs.json`: `sha256` of the body
+  plus `mountUUID`) is absent, differs in digest, or names a different mount UUID.
+  Read-back cannot be compared: secret fields come back redacted and rotating
+  engines replace the seeded credential, so a rewrite breaks them. State reads fail
+  closed on anything but NotFound (read error, missing key, bad or `null` JSON,
+  incomplete record), because treating them as empty rewrites every entry, except
+  with zero entries declared, where an unusable state Secret logs one Warn and
+  skips the step so a deployment without engine configs keeps reconciling. Every
+  Secret is read once per pass, empty or non-UTF-8 values fail the pass, and every
+  mount UUID is checked before any write. A missing state Secret is created before
+  the first Vault write, so one that cannot be created fails the pass with nothing
+  written instead of rewriting Vault every pass. Writes checkpoint the state even
+  when a later entry fails, so one bad entry does not rewrite the rest every pass.
+  Removal drops the record and never deletes or rewrites Vault, under any
+  `pruneMode`.
+  Errors are scrubbed of resolved Secret values and a failed Vault write carries
+  only path and status (`internal/vault/engineconfig.go`); never log values.
+  `roles` still rejects `config`, so the two sections cannot write one path.
 - **Reconciler is testable.** It depends on narrow `VaultOps` / `PodOps`
   interfaces (satisfied by the real clients) and the `fetch.Fetcher` interface,
   so `reconcile_test.go` drives it with fakes — no cluster or Vault required.

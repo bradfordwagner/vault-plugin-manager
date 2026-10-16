@@ -1,7 +1,8 @@
 // Package reconcile drives Vault toward a parsed ConfigMap spec: it fetches and
 // exec-copies plugin binaries onto every Vault pod, registers versions in the
-// catalog, reconciles secret/auth mounts, reloads changed plugins, and prunes
-// what has left the spec.
+// catalog, reconciles secret/auth mounts, reloads changed plugins, writes engine
+// configs whose content changed, upserts roles, and prunes what has left the
+// spec.
 package reconcile
 
 import (
@@ -33,6 +34,8 @@ type VaultOps interface {
 	EnsureRole(ctx context.Context, r vault.Role) (changed bool, err error)
 	ListRoles(ctx context.Context, mount, rolesPath string) ([]string, error)
 	DeleteRole(ctx context.Context, mount, rolesPath, name string) error
+	SecretMountUUIDs(ctx context.Context) (map[string]string, error)
+	WriteEngineConfig(ctx context.Context, path string, body map[string]any) error
 }
 
 // PodOps is the subset of the Kubernetes client the reconciler uses.
@@ -42,12 +45,21 @@ type PodOps interface {
 	RemoveFile(ctx context.Context, ns, pod, container, path string) error
 }
 
+// SecretOps is the subset of the Kubernetes client the engine config step uses
+// to read referenced Secrets and to load and save the state Secret.
+type SecretOps interface {
+	GetSecretData(ctx context.Context, ns, name string) (map[string][]byte, string, error)
+	PutSecretData(ctx context.Context, ns, name, resourceVersion string, data map[string][]byte) (string, error)
+}
+
 // Config holds the static (bootstrap) settings the reconciler needs.
 type Config struct {
 	VaultNamespace   string
 	VaultPodSelector string
 	VaultContainer   string
 	PluginDir        string
+	SecretNamespace  string // namespace of referenced Secrets and the state Secret
+	StateSecretName  string
 }
 
 // Reconciler is idempotent and level-triggered: each Reconcile drives live state
@@ -55,16 +67,18 @@ type Config struct {
 type Reconciler struct {
 	vault   VaultOps
 	pods    PodOps
+	secrets SecretOps
 	fetcher fetch.Fetcher
 	cfg     Config
 	log     *zap.SugaredLogger
 }
 
 // New builds a Reconciler.
-func New(v VaultOps, pods PodOps, f fetch.Fetcher, cfg Config) *Reconciler {
+func New(v VaultOps, pods PodOps, secrets SecretOps, f fetch.Fetcher, cfg Config) *Reconciler {
 	return &Reconciler{
 		vault:   v,
 		pods:    pods,
+		secrets: secrets,
 		fetcher: f,
 		cfg:     cfg,
 		log:     logging.Log().With("component", "reconcile"),
@@ -167,13 +181,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 		r.log.With("plugin", name).Info("reloaded plugin")
 	}
 
-	// 4. Reconcile secret-engine roles (upsert declared roles; prune undeclared
+	// 4. Write engine configs whose content or mount changed. After the reload,
+	//    so a plugin is configured on the binary it will run; before roles,
+	//    which commonly depend on the engine being configured.
+	if err := r.reconcileEngineConfigs(ctx, spec); err != nil {
+		return err
+	}
+
+	// 5. Reconcile secret-engine roles (upsert declared roles; prune undeclared
 	//    ones on managed mounts under PruneFull).
 	if err := r.reconcileRoles(ctx, spec); err != nil {
 		return err
 	}
 
-	// 5. Prune what left the spec.
+	// 6. Prune what left the spec.
 	return r.prune(ctx, spec.Settings.PruneMode, pods, desiredMounts, desiredVersions)
 }
 

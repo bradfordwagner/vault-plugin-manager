@@ -17,6 +17,9 @@ type Spec struct {
 	Catalog  []CatalogEntry `yaml:"catalog"`
 	Mounts   []MountEntry   `yaml:"mounts"`
 	Roles    []RoleEntry    `yaml:"roles"`
+	// EngineConfigs declares plugin engine config to write, ordered after mounts
+	// and before roles.
+	EngineConfigs []EngineConfigEntry `yaml:"engineConfigs"`
 }
 
 // Settings are the runtime-tunable knobs sourced from the watched ConfigMap.
@@ -191,7 +194,8 @@ type MountConfig struct {
 // RoleEntry declares a secret-engine role to UPSERT at
 // <Mount>/<RolesPath>/<Name>. Data is written verbatim to the plugin, which owns
 // the schema. Role bodies are non-secret and git-owned; the engine's own
-// `config` is a separately-seeded zero-secret and is NEVER reconciled here.
+// `config` is written only through EngineConfigEntry, on a content change, and
+// is never reconciled as a role.
 type RoleEntry struct {
 	Mount string `yaml:"mount"`
 	Name  string `yaml:"name"`
@@ -202,4 +206,28 @@ type RoleEntry struct {
 	// the plugin owns the schema, vpm owns placement.
 	RolesPath string         `yaml:"rolesPath"`
 	Data      map[string]any `yaml:"data"`
+}
+
+// DefaultEngineConfigPath is the subpath used when an EngineConfigEntry omits
+// path: the conventional <mount>/config endpoint.
+const DefaultEngineConfigPath = "config"
+
+// SectionEngineConfigs names the engineConfigs section in a Change.
+const SectionEngineConfigs = "engineConfigs"
+
+// EngineConfigEntry declares plugin engine config to write at <Mount>/<Path>.
+// Data carries non-secret fields verbatim; SecretRef names a Kubernetes Secret
+// whose values fill in the secret fields. At least one of the two is required.
+// After Validate, Mount is slash-trimmed and Path is normalized.
+type EngineConfigEntry struct {
+	Mount     string         `yaml:"mount"`
+	Path      string         `yaml:"path"` // defaulted to DefaultEngineConfigPath and slash-trimmed by Validate
+	Data      map[string]any `yaml:"data"`
+	SecretRef *SecretRef     `yaml:"secretRef"`
+}
+
+// SecretRef maps Vault config fields to keys of a Kubernetes Secret.
+type SecretRef struct {
+	Name string            `yaml:"name"`
+	Keys map[string]string `yaml:"keys"` // vault field -> Secret data key
 }

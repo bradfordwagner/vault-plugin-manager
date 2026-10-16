@@ -134,14 +134,29 @@ func TestOnlySuccessStampsFreshness(t *testing.T) {
 }
 
 func TestSpecEntriesTracksTheLatestSpec(t *testing.T) {
-	SpecEntries(3, 2, 1)
-	SpecEntries(1, 0, 0) // a shrunken spec must be visible, not sticky
+	SpecEntries(3, 2, 1, 4)
+	if got := testutil.ToFloat64(specEntries.WithLabelValues(KindEngineConfigs)); got != 4 {
+		t.Fatalf("spec_entries{kind=engineConfigs} = %v, want 4", got)
+	}
+	SpecEntries(1, 0, 0, 0) // a shrunken spec must be visible, not sticky
 	for _, tc := range []struct {
 		kind string
 		want float64
-	}{{KindCatalog, 1}, {KindMounts, 0}, {KindRoles, 0}} {
+	}{{KindCatalog, 1}, {KindMounts, 0}, {KindRoles, 0}, {KindEngineConfigs, 0}} {
 		if got := testutil.ToFloat64(specEntries.WithLabelValues(tc.kind)); got != tc.want {
 			t.Errorf("spec_entries{kind=%s} = %v, want %v", tc.kind, got, tc.want)
+		}
+	}
+}
+
+// The engine_config action is pre-seeded like the other write actions so a
+// pod that has not written an engine config yet still exposes both series.
+func TestEngineConfigActionIsPreSeeded(t *testing.T) {
+	body := scrape(t)
+	for _, result := range []string{ResultSuccess, ResultError} {
+		want := `vpm_vault_actions_total{action="engine_config",result="` + result + `"}`
+		if !strings.Contains(body, want) {
+			t.Errorf("want a pre-seeded series: %s", want)
 		}
 	}
 }

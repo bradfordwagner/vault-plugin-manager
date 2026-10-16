@@ -45,6 +45,7 @@ Configuration is split in two:
 | `VAULT_NAMESPACE` | own namespace | where Vault pods run |
 | `VAULT_CONTAINER` | `vault` | container to exec into |
 | `PLUGIN_DIR` | `/vault/plugins` | Vault `plugin_directory` |
+| `STATE_SECRET_NAME` | `vault-plugin-manager-state` | Secret (in `CONFIGMAP_NAMESPACE`) where the manager records the digest and mount UUID of each engine config it wrote |
 | `HEALTH_ADDR` | `:8080` | liveness/readiness **and `/metrics`** listen address; empty disables |
 
 ### Runtime tunables (ConfigMap `settings:`)
@@ -109,7 +110,66 @@ roles:                               # secret-engine role bodies to UPSERT (opti
     rolesPath: realm/example/roles   # optional; default `roles`
     data:
       ttl: "1h"
+
+engineConfigs:                       # plugin engine config to write on change (optional)
+  - mount: foo                       # references a secret mounts[].path
+    path: config                     # optional; default `config`
+    data:                            # non-secret fields, written as-is
+      app_id: 4627856
+    secretRef:                       # optional; values come from a Secret in CONFIGMAP_NAMESPACE
+      name: foo-engine-credentials
+      keys:                          # <vault field>: <Secret data key>
+        prv_key: private-key.pem
 ```
+
+**`engineConfigs`** writes a plugin's own config endpoint at `<mount>/<path>`, for
+engines that need credentials (a GitHub App private key, a client secret) that
+should not live in the ConfigMap. The body is `data` plus one field per
+`secretRef.keys` entry, set to that Secret value as a string and written verbatim
+(no trimming). At least one of `data` or `secretRef` is required, and a field may
+not appear in both. `mount` must be a declared `type: secret` mount, `(mount, path)`
+must be unique, and `path` follows the `rolesPath` rules and may not equal or sit
+under a `rolesPath` declared on the same mount. `data` values must be
+JSON-encodable: quote anything YAML would read as a timestamp.
+
+- **Written on change, not every pass.** Engine config is not read-compared like
+  roles: secret fields read back redacted, and some engines rotate a seeded
+  credential, so rewriting the seeded value would break them. The manager instead
+  records a sha256 of each body it wrote, with the UUID of the mount it went to, in
+  the state Secret (`STATE_SECRET_NAME`, key `engine-configs.json`). An entry is
+  written when it has no record, when its body changed, or when its mount was
+  disabled and re-enabled (new UUID). Each write logs `wrote engine config` with
+  `mount`, `path` and `reason` (`unrecorded`, `changed`, `mount_recreated`).
+- **Secrets are read every pass**, so a rotated Secret value lands within
+  `resyncInterval`. Each Secret is read once per pass and every entry resolves from
+  that read.
+- **The state Secret is vpm-owned.** Each update replaces its labels and
+  annotations, so nothing else should annotate it.
+- **It fails closed.** The pass fails, with nothing written, when the state Secret
+  cannot be read (anything but not found), has no `engine-configs.json` key, holds
+  malformed or `null` JSON, or has a record without both fields. It also fails when
+  a referenced Secret or key is missing, or a value is empty or not valid UTF-8, or
+  a referenced mount is not a live secret mount. A field whose real value is the
+  empty string goes in `data`, not a Secret. With no `engineConfigs` entries, an
+  unusable state Secret only logs a warning and the step is skipped.
+- **The state Secret is created before the first write.** When it does not exist
+  and an entry needs a write, the manager creates it (holding `{}`) before writing
+  Vault, so a Secret it cannot create fails the pass with nothing written.
+- **Errors never carry Secret values.** A failed Vault write reports only the path
+  and HTTP status (the response body is withheld, since a plugin may echo what it
+  was sent), and any other error from this step is scrubbed of the Secret values it
+  resolved. Logs name fields, never values.
+- **Removing an entry never touches Vault**, under any `pruneMode`; only its record
+  is dropped, so re-adding it later writes again.
+- **Forcing a rewrite:** delete the entry's record from the state Secret, or the
+  whole Secret. Fix or delete a Secret the manager rejects as malformed.
+- **Writes are at least once.** The manager writes Vault first and records the
+  digest second, so after a crash between the two, a failed state save, or a write
+  that errored after Vault accepted it, the write is retried on later passes until
+  the save lands. Harmless for static config; a rotating engine is reseeded with
+  the ConfigMap's values.
+  A mount that already holds config is overwritten once when its entry is first
+  added.
 
 **`roles`** upserts each role at `<mount>/<rolesPath>/<name>`. `data` is written
 verbatim to the plugin, which owns the schema — vpm only owns *placement*.
@@ -249,7 +309,7 @@ Kubernetes RBAC** — the endpoint reads only in-process state.
 | `vpm_vault_actions_total` | counter | `action`, `result` |
 | `vpm_reconcile_duration_seconds` | histogram | — |
 | `vpm_last_successful_reconcile_timestamp_seconds` | gauge | — |
-| `vpm_spec_entries` | gauge | `kind` (`catalog`/`mounts`/`roles`) |
+| `vpm_spec_entries` | gauge | `kind` (`catalog`/`mounts`/`roles`/`engineConfigs`) |
 | `vpm_vault_token_valid` | gauge | — |
 | `vpm_configmap_watcher_running` | gauge | — |
 | `vpm_build_info` | gauge | `version` |
@@ -304,7 +364,8 @@ Every reconcile logs **what changed in the ConfigMap** before the reconciler log
 **what it did about it**. Changes are keyed the way the reconciler keys them, so a
 line maps to the work it causes: `name@version` for catalog entries (versions
 coexist, so a bump reads as a remove plus an add), `type:path` for mounts, and
-`mount/rolesPath/name` for roles.
+`mount/rolesPath/name` for roles, and `mount/path` for engine configs, which
+report the `data` keys and `secretRef` fields that moved, never values.
 
 ```
 INFO  configmap change: catalog foo@1.1.0 added: type=secret, url=https://…/foo.tar.gz  section=catalog key=foo@1.1.0 action=added
@@ -362,6 +423,12 @@ path "sys/auth" {
 path "sys/auth/*" {
   capabilities = ["create", "read", "update", "delete", "sudo"]
 }
+# Only when the spec declares engineConfigs: write each config endpoint. No `read`
+# is needed (the manager never reads engine config back). The live mount UUIDs come
+# from the `sys/mounts` read above.
+path "foo/config" {
+  capabilities = ["create", "update"]
+}
 ```
 
 Bind the manager's ServiceAccount to a Vault role backed by this policy, e.g.:
@@ -418,8 +485,24 @@ The manager's ServiceAccount needs, in the Vault namespace:
 - `configmaps`: `get`, `list`, `watch`
 - `pods`: `get`, `list`
 - `pods/exec`: `create`
+- `secrets`: `get`, `update` on the state Secret only (`resourceNames`)
+- with `engineConfigs.enabled`: `secrets` `create` (to make the state Secret before
+  the first write; Kubernetes cannot scope `create` by name) and `get` on each
+  Secret in `engineConfigs.secretNames`
 
-These are rendered by the Helm chart (`rbac.create=true`).
+These are rendered by the Helm chart (`rbac.create=true`). A `secretRef` naming a
+Secret that is not in `engineConfigs.secretNames` fails the pass with a 403.
+
+### Upgrading
+
+Every pass reads the state Secret named by `STATE_SECRET_NAME` in
+`CONFIGMAP_NAMESPACE`. The chart grants `get`/`update` on it automatically, in the
+release namespace. With `rbac.create=false`, or a ConfigMap outside the release
+namespace, grant `secrets` `get`,`update` on that Secret yourself, plus `create`
+on `secrets` (for the state Secret) and `get` on each referenced Secret to use
+`engineConfigs`. Without
+`engineConfigs` entries an unreadable state Secret only logs a warning; with
+entries it fails the pass.
 
 ## Helm chart
 
@@ -448,6 +531,19 @@ helm upgrade vault-plugin-manager ./chart \
 
 `health.enabled=false` drops both probes, the container port, and the probe
 server itself (`HEALTH_ADDR=""`).
+
+### Engine configs
+
+`stateSecretName` (default `<fullname>-state`) names the state Secret, which the
+Role always grants `get`/`update` on. Set `engineConfigs.enabled=true` and list the
+Secrets your `engineConfigs[].secretRef.name` entries use in
+`engineConfigs.secretNames`; declare the entries under `configMap.spec.engineConfigs`.
+
+```sh
+helm upgrade vault-plugin-manager ./chart \
+  --set engineConfigs.enabled=true \
+  --set 'engineConfigs.secretNames={foo-engine-credentials}'
+```
 
 ### Metrics and the ServiceMonitor
 

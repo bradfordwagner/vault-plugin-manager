@@ -117,6 +117,20 @@ configmap_yaml() { # $1 = full|pruned ; emits the ConfigMap
   if [[ "${HTTP_MOUNT_OPTIONS:-}" == "none" ]]; then
     http_options=""
   fi
+  # ENGINE_CONFIG=none drops the engineConfigs entry, which is how the run
+  # exercises an entry being REMOVED from the spec.
+  local engine_configs="
+    engineConfigs:
+      - mount: e2e-http
+        data:
+          app_id: 42
+        secretRef:
+          name: e2e-engine-creds
+          keys:
+            prv_key: prv_key"
+  if [[ "${ENGINE_CONFIG:-}" == "none" ]]; then
+    engine_configs=""
+  fi
   if [[ "$1" == "full" ]]; then
     oci_block="
       - name: testplugin-oci
@@ -158,7 +172,7 @@ data:
         type: secret
         version: "1.0.0"
         config:
-          description: "${HTTP_MOUNT_DESC:-e2e http mount}"${http_options}${oci_mount}
+          description: "${HTTP_MOUNT_DESC:-e2e http mount}"${http_options}${oci_mount}${engine_configs}
 EOF
 }
 
@@ -215,6 +229,7 @@ path "sys/mounts"                 { capabilities = ["read"] }
 path "sys/mounts/*"               { capabilities = ["create","read","update","delete"] }
 path "sys/auth"                   { capabilities = ["read"] }
 path "sys/auth/*"                 { capabilities = ["create","read","update","delete","sudo"] }
+path "e2e-http/config"            { capabilities = ["create","update"] }
 EOF
 vault policy write vault-plugin-manager /tmp/policy.hcl
 vault write auth/kubernetes/role/vault-plugin-manager \
@@ -230,6 +245,13 @@ kubectl -n "$NS" rollout restart deploy/plugin-http
 kubectl -n "$NS" rollout status deploy/plugin-http --timeout=120s
 SHA="$(kubectl -n "$NS" exec deploy/plugin-http -- sha256sum /www/foo | awk '{print $1}')"
 echo "plugin sha256=${SHA}"
+# The Secret the engineConfigs entry reads its prv_key from. Applied (not
+# created) so the rotation step can re-apply it with a new value.
+engine_secret() { # $1 = prv_key value
+  kubectl -n "$NS" create secret generic e2e-engine-creds \
+    --from-literal=prv_key="$1" --dry-run=client -o yaml | kubectl apply -f -
+}
+engine_secret KEY1
 configmap_yaml full | kubectl apply -f -
 
 ##### 7. install the manager via the Helm chart #####
@@ -276,6 +298,15 @@ got_oci="$(vexec 'vault read -field=value e2e-oci/foo')"
 [[ "$got_http" == "hello-http" ]] || { echo "http readback mismatch: '$got_http'"; exit 1; }
 [[ "$got_oci"  == "hello-oci"  ]] || { echo "oci readback mismatch: '$got_oci'"; exit 1; }
 echo "ok: read back hello-http and hello-oci"
+
+##### 8b. the engine config is written from literal data + the Secret #####
+log "Asserting the engine config was written to the mount"
+retry 120 "engine config prv_key from the Secret" bash -c \
+  "[[ \"\$(kubectl -n $NS exec -i $VPOD -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault read -field=prv_key e2e-http/config)\" == KEY1 ]]"
+retry 60 "engine config app_id from the literal data" bash -c \
+  "[[ \"\$(kubectl -n $NS exec -i $VPOD -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault read -field=app_id e2e-http/config)\" == 42 ]]"
+kubectl -n "$NS" get secret "${MANAGER_DEPLOY}-state" >/dev/null
+echo "ok: engine config written, state Secret present"
 
 ##### 9. prune: drop the OCI entry, expect cleanup #####
 log "Testing prune (removing the OCI plugin from the ConfigMap)"
@@ -372,10 +403,12 @@ log "Checking the Vault action counters go flat at steady state"
 reconciles_before="$(metrics_value 'vpm_reconcile_total{result="success"')"
 register_before="$(metrics_value 'vpm_vault_actions_total{action="register",result="success"}')"
 mount_before="$(metrics_value 'vpm_vault_actions_total{action="mount",result="success"}')"
+engine_config_before="$(metrics_value 'vpm_vault_actions_total{action="engine_config",result="success"}')"
 sleep 45
 reconciles_after="$(metrics_value 'vpm_reconcile_total{result="success"')"
 register_after="$(metrics_value 'vpm_vault_actions_total{action="register",result="success"}')"
 mount_after="$(metrics_value 'vpm_vault_actions_total{action="mount",result="success"}')"
+engine_config_after="$(metrics_value 'vpm_vault_actions_total{action="engine_config",result="success"}')"
 [[ "$reconciles_after" -gt "$reconciles_before" ]] || {
   echo "no reconcile passes ran during the steady-state window (${reconciles_before} -> ${reconciles_after}); the check proves nothing"
   exit 1
@@ -388,6 +421,77 @@ mount_after="$(metrics_value 'vpm_vault_actions_total{action="mount",result="suc
   echo "mount counted a no-op pass: ${mount_before} -> ${mount_after} across $((reconciles_after - reconciles_before)) passes"
   exit 1
 }
+[[ "$engine_config_after" -eq "$engine_config_before" ]] || {
+  echo "engine_config counted a no-op pass: ${engine_config_before} -> ${engine_config_after} across $((reconciles_after - reconciles_before)) passes"
+  exit 1
+}
 echo "ok: counters flat across $((reconciles_after - reconciles_before)) steady-state passes"
+
+##### 11. engine config: rotation, mount recreation, restart, removal #####
+# The write is keyed on content and on the mount's identity, and the record of
+# what was written lives in a Secret so it survives the manager. Each case below
+# is one way that record can be wrong, which a unit test over fakes cannot settle
+# against a real mount whose storage is wiped on disable.
+read_engine_field() { # $1 = field
+  vexec "vault read -field=$1 e2e-http/config" 2>/dev/null
+}
+engine_field_is() { # $1 = field, $2 = expected value
+  [[ "$(read_engine_field "$1")" == "$2" ]]
+}
+
+log "Checking a rotated Secret value is written to the mount"
+engine_secret KEY2
+retry 60 "rotated prv_key written" engine_field_is prv_key KEY2
+engine_field_is app_id 42 || { echo "app_id lost on rotation"; exit 1; }
+
+log "Checking a recreated mount gets its engine config back"
+vexec 'vault secrets disable e2e-http'
+retry 120 "engine config rewritten after the mount was recreated" engine_field_is prv_key KEY2
+recreate_logged() {
+  [[ "$(kubectl -n "$NS" logs "$(manager_pod)" --tail=-1 | grep 'wrote engine config' | { grep -Ec 'reason"?[:=] ?"?mount_recreated' || true; })" -gt 0 ]]
+}
+retry 60 "mount_recreated write logged" recreate_logged
+assert_no_restarts "after mount recreation"
+
+log "Checking a manager restart does not rewrite an unchanged engine config"
+vexec 'vault write e2e-http/config prv_key=manual app_id=42'
+kubectl -n "$NS" rollout restart "deploy/${MANAGER_DEPLOY}"
+kubectl -n "$NS" rollout status "deploy/${MANAGER_DEPLOY}" --timeout=180s
+MGR_POD="$(manager_pod)"
+MGR_IP="$(kubectl -n "$NS" get pod "$MGR_POD" -o jsonpath='{.status.podIP}')"
+retry 60 "metrics endpoint on the new pod" vexec \
+  "wget -qO- http://${MGR_IP}:8080/metrics | grep -q '^vpm_build_info'"
+# Two passes, so a write the lost state would cause has had a full pass to land.
+reconciled_twice() {
+  [[ "$(metrics_value 'vpm_reconcile_total{result="success"')" -ge 2 ]]
+}
+retry 90 "two successful reconciles on the new pod" reconciled_twice
+engine_field_is prv_key manual || { echo "restart rewrote the engine config: prv_key is '$(read_engine_field prv_key)'"; exit 1; }
+rewrites="$(kubectl -n "$NS" logs "$MGR_POD" --tail=-1 | { grep -c 'wrote engine config' || true; })"
+[[ "$rewrites" -eq 0 ]] || { echo "new pod wrote the engine config ${rewrites}x after a restart"; exit 1; }
+echo "ok: restart left the engine config alone"
+
+log "Checking removing the entry leaves the config in Vault"
+read_engine_state() {
+  kubectl -n "$NS" get secret "${MANAGER_DEPLOY}-state" -o jsonpath='{.data.engine-configs\.json}' | base64 -d
+}
+state_json="$(read_engine_state)"
+grep -q '"e2e-http/config"' <<<"$state_json" || { echo "state Secret does not record e2e-http/config before the removal: $state_json"; exit 1; }
+ENGINE_CONFIG=none
+configmap_yaml pruned | kubectl apply -f -
+removal_logged() {
+  [[ "$(kubectl -n "$NS" logs "$MGR_POD" --tail=-1 | { grep -c 'configmap change: engineConfigs' || true; })" -gt 0 ]]
+}
+retry 60 "entry removal logged" removal_logged
+passes="$(metrics_value 'vpm_reconcile_total{result="success"')"
+passed_again() {
+  [[ "$(metrics_value 'vpm_reconcile_total{result="success"')" -ge $((passes + 2)) ]]
+}
+retry 90 "successful reconciles after the removal" passed_again
+engine_field_is prv_key manual || { echo "removing the entry changed the config: prv_key is '$(read_engine_field prv_key)'"; exit 1; }
+state_json="$(read_engine_state)"
+[[ "$state_json" == "{}" ]] || { echo "state Secret is not empty after the removal: $state_json"; exit 1; }
+echo "ok: removal left the config in Vault and dropped the state record"
+assert_no_restarts "after engine config removal"
 
 log "E2E PASSED for Vault ${VAULT_VERSION}"

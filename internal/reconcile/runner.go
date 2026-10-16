@@ -184,7 +184,7 @@ func (ru *Runner) Run(ctx context.Context) error {
 			}
 			ru.logChanges(applied, spec, trigger, counted)
 			counted = spec
-			metrics.SpecEntries(len(spec.Catalog), len(spec.Mounts), len(spec.Roles))
+			metrics.SpecEntries(len(spec.Catalog), len(spec.Mounts), len(spec.Roles), len(spec.EngineConfigs))
 			if err = ru.rec.Reconcile(ctx, spec); err != nil {
 				result = metrics.ResultError
 				ru.log.With("error", err).Error("reconcile failed")
