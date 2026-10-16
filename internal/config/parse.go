@@ -80,8 +80,8 @@ func (s *Spec) Validate() error {
 			return fmt.Errorf("roles[%d] (%s): references unknown mount %q", i, r.Name, r.Mount)
 		case r.Name == "config":
 			// Hard invariant: a role never lands on <mount>/config; engine config
-			// is written only through engineConfigs, on a content change.
-			return fmt.Errorf("roles[%d] (%s): name %q is reserved (vpm never writes <mount>/config)", i, r.Mount, r.Name)
+			// is written only through engineConfigs.
+			return fmt.Errorf("roles[%d] (%s): name %q is reserved; engine config is written through engineConfigs", i, r.Mount, r.Name)
 		case strings.Contains(r.Name, "/"):
 			return fmt.Errorf("roles[%d] (%s): name %q must not contain %q", i, r.Mount, r.Name, "/")
 		}

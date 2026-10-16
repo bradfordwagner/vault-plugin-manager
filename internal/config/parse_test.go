@@ -189,6 +189,16 @@ mounts:
 	}
 }
 
+func TestParseRoleNamedConfigPointsAtEngineConfigs(t *testing.T) {
+	_, err := Parse([]byte(engineConfigBase + "roles:\n  - mount: github\n    name: config\n"))
+	if err == nil {
+		t.Fatal("expected an error for a role named config")
+	}
+	if !strings.Contains(err.Error(), "reserved") || !strings.Contains(err.Error(), "engineConfigs") {
+		t.Errorf("error %q does not say config is reserved for engineConfigs", err)
+	}
+}
+
 func TestParseInvalid(t *testing.T) {
 	cases := map[string]string{
 		"missing source": `
@@ -319,6 +329,10 @@ func TestParseValidEngineConfigs(t *testing.T) {
 		"roles path on a different mount": {
 			raw:       "roles:\n  - mount: other\n    name: r\nengineConfigs:\n  - mount: github\n    path: roles/bootstrap\n    data: {a: 1}\n",
 			wantMount: "github", wantPath: "roles/bootstrap",
+		},
+		"path beside the default rolesPath": {
+			raw:       "roles:\n  - mount: github\n    name: r\nengineConfigs:\n  - mount: github\n    path: rolesX\n    data: {a: 1}\n",
+			wantMount: "github", wantPath: "rolesX",
 		},
 		"github shape": {
 			raw: "roles:\n  - mount: github\n    name: r\n    rolesPath: permissionset\n" +
