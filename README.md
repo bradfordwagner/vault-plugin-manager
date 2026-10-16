@@ -143,6 +143,8 @@ JSON-encodable: quote anything YAML would read as a timestamp.
 - **Secrets are read every pass**, so a rotated Secret value lands within
   `resyncInterval`. Each Secret is read once per pass and every entry resolves from
   that read.
+- **The state Secret is vpm-owned.** Each update replaces its labels and
+  annotations, so nothing else should annotate it.
 - **It fails closed.** The pass fails, with nothing written, when the state Secret
   cannot be read (anything but not found), has no `engine-configs.json` key, holds
   malformed or `null` JSON, or has a record without both fields. It also fails when
@@ -497,7 +499,8 @@ Every pass reads the state Secret named by `STATE_SECRET_NAME` in
 `CONFIGMAP_NAMESPACE`. The chart grants `get`/`update` on it automatically, in the
 release namespace. With `rbac.create=false`, or a ConfigMap outside the release
 namespace, grant `secrets` `get`,`update` on that Secret yourself, plus `create`
-and `get` on the referenced Secrets to use `engineConfigs`. Without
+on `secrets` (for the state Secret) and `get` on each referenced Secret to use
+`engineConfigs`. Without
 `engineConfigs` entries an unreadable state Secret only logs a warning; with
 entries it fails the pass.
 
