@@ -40,11 +40,12 @@ func (c Change) String() string {
 }
 
 // Diff reports how new differs from old, in the order the reconcile loop acts:
-// settings, catalog, mounts, roles. Entries are identified by the same keys the
+// settings, catalog, mounts, engineConfigs, roles. Entries are identified by the same keys the
 // reconciler uses, so a change maps to the work it causes:
 //
 //	catalog  name@version   (versions coexist, so a bump is a remove + an add)
 //	mounts   type:path
+//	engineConfigs  mount/path
 //	roles    mount/rolesPath/name
 //
 // A nil old means "nothing seen yet": every entry reports as added and settings
@@ -64,6 +65,7 @@ func Diff(old, new *Spec) []Change {
 	out = append(out, diffSettings(old.Settings, new.Settings)...)
 	out = append(out, diffCatalog(old.Catalog, new.Catalog)...)
 	out = append(out, diffMounts(old.Mounts, new.Mounts)...)
+	out = append(out, diffEngineConfigs(old.EngineConfigs, new.EngineConfigs)...)
 	out = append(out, diffRoles(old.Roles, new.Roles)...)
 	return out
 }
@@ -151,6 +153,37 @@ func diffMounts(old, new []MountEntry) []Change {
 	return out
 }
 
+func diffEngineConfigs(old, new []EngineConfigEntry) []Change {
+	oldByKey := make(map[string]EngineConfigEntry, len(old))
+	for _, e := range old {
+		oldByKey[engineConfigKey(e)] = e
+	}
+	newByKey := make(map[string]EngineConfigEntry, len(new))
+	for _, e := range new {
+		newByKey[engineConfigKey(e)] = e
+	}
+
+	var out []Change
+	for _, key := range sortedKeys(oldByKey, newByKey) {
+		o, hadOld := oldByKey[key]
+		n, hasNew := newByKey[key]
+		switch {
+		case !hadOld:
+			out = append(out, Change{SectionEngineConfigs, key, ActionAdded, engineConfigSummary(n)})
+		case !hasNew:
+			// Removing an entry never touches Vault.
+			out = append(out, Change{SectionEngineConfigs, key, ActionRemoved, "config left in Vault"})
+		default:
+			// Values are the plugin's schema and may be secret, so report which
+			// keys moved, never the values.
+			if d := engineConfigDetail(o, n); d != "" {
+				out = append(out, Change{SectionEngineConfigs, key, ActionChanged, d})
+			}
+		}
+	}
+	return out
+}
+
 func diffRoles(old, new []RoleEntry) []Change {
 	oldByKey := make(map[string]RoleEntry, len(old))
 	for _, r := range old {
@@ -196,6 +229,47 @@ func roleKey(r RoleEntry) string {
 		rolesPath = DefaultRolesPath
 	}
 	return normMountPath(r.Mount) + "/" + rolesPath + "/" + r.Name
+}
+
+// engineConfigKey matches the Vault path the entry is written to, with path
+// defaulted and trimmed the same way Validate does.
+func engineConfigKey(e EngineConfigEntry) string {
+	path := strings.Trim(e.Path, "/")
+	if path == "" {
+		path = DefaultEngineConfigPath
+	}
+	return normMountPath(e.Mount) + "/" + path
+}
+
+// engineConfigSummary names the fields an entry sets without their values.
+func engineConfigSummary(e EngineConfigEntry) string {
+	s := "data keys: " + joinKeys(e.Data)
+	if e.SecretRef != nil {
+		s += fmt.Sprintf(", secretRef %s fields: %s", e.SecretRef.Name, joinKeys(e.SecretRef.Keys))
+	}
+	return s
+}
+
+func engineConfigDetail(o, n EngineConfigEntry) string {
+	var parts []string
+	if keys := changedDataKeys(o.Data, n.Data); len(keys) > 0 {
+		parts = append(parts, "data keys: "+strings.Join(keys, ", "))
+	}
+	switch {
+	case o.SecretRef == nil && n.SecretRef == nil:
+	case o.SecretRef == nil:
+		parts = append(parts, fmt.Sprintf("secretRef added: %s fields: %s", n.SecretRef.Name, joinKeys(n.SecretRef.Keys)))
+	case n.SecretRef == nil:
+		parts = append(parts, "secretRef removed: "+o.SecretRef.Name)
+	default:
+		if o.SecretRef.Name != n.SecretRef.Name {
+			parts = append(parts, fmt.Sprintf("secretRef name %s -> %s", o.SecretRef.Name, n.SecretRef.Name))
+		}
+		if keys := changedStringKeys(o.SecretRef.Keys, n.SecretRef.Keys); len(keys) > 0 {
+			parts = append(parts, "secretRef fields: "+strings.Join(keys, ", "))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 func catalogDetail(o, n CatalogEntry) string {

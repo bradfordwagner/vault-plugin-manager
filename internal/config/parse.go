@@ -1,8 +1,12 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -43,7 +47,7 @@ func (s *Spec) Validate() error {
 		catalog[c.Name] = c
 	}
 
-	mountPaths := make(map[string]bool, len(s.Mounts))
+	mountTypes := make(map[string]map[PluginType]bool, len(s.Mounts))
 	for i, m := range s.Mounts {
 		switch {
 		case m.Path == "":
@@ -58,7 +62,11 @@ func (s *Spec) Validate() error {
 		if _, ok := catalog[m.Plugin]; !ok {
 			return fmt.Errorf("mounts[%d] (%s): references unknown plugin %q", i, m.Path, m.Plugin)
 		}
-		mountPaths[normMountPath(m.Path)] = true
+		mp := normMountPath(m.Path)
+		if mountTypes[mp] == nil {
+			mountTypes[mp] = map[PluginType]bool{}
+		}
+		mountTypes[mp][m.Type] = true
 	}
 
 	for i := range s.Roles {
@@ -68,11 +76,11 @@ func (s *Spec) Validate() error {
 			return fmt.Errorf("roles[%d]: mount is required", i)
 		case r.Name == "":
 			return fmt.Errorf("roles[%d] (%s): name is required", i, r.Mount)
-		case !mountPaths[normMountPath(r.Mount)]:
+		case mountTypes[normMountPath(r.Mount)] == nil:
 			return fmt.Errorf("roles[%d] (%s): references unknown mount %q", i, r.Name, r.Mount)
 		case r.Name == "config":
-			// Hard invariant: vpm must never write <mount>/config; that path is a
-			// separately-seeded zero-secret and is never reconciled here.
+			// Hard invariant: a role never lands on <mount>/config; engine config
+			// is written only through engineConfigs, on a content change.
 			return fmt.Errorf("roles[%d] (%s): name %q is reserved (vpm never writes <mount>/config)", i, r.Mount, r.Name)
 		case strings.Contains(r.Name, "/"):
 			return fmt.Errorf("roles[%d] (%s): name %q must not contain %q", i, r.Mount, r.Name, "/")
@@ -80,11 +88,127 @@ func (s *Spec) Validate() error {
 		// Default and validate the subpath between the mount and the role name.
 		// Empty -> `roles` (classic <mount>/roles/<name> layout). The value is
 		// trimmed of surrounding slashes so it composes cleanly with the mount.
-		normalized, err := normRolesPath(r.RolesPath)
+		normalized, err := normSubPath("rolesPath", r.RolesPath, DefaultRolesPath)
 		if err != nil {
 			return fmt.Errorf("roles[%d] (%s): %w", i, r.Mount, err)
 		}
 		r.RolesPath = normalized
+	}
+
+	return s.validateEngineConfigs(mountTypes)
+}
+
+// validateEngineConfigs checks each engine config and normalizes Mount and
+// Path in place. It runs after roles so RolesPath is already normalized.
+func (s *Spec) validateEngineConfigs(mountTypes map[string]map[PluginType]bool) error {
+	seen := make(map[string]bool, len(s.EngineConfigs))
+	for i := range s.EngineConfigs {
+		e := &s.EngineConfigs[i]
+		if e.Mount == "" {
+			return fmt.Errorf("engineConfigs[%d]: mount is required", i)
+		}
+		mount := normMountPath(e.Mount)
+		types := mountTypes[mount]
+		switch {
+		case types == nil:
+			return fmt.Errorf("engineConfigs[%d] (%s): references unknown mount %q", i, e.Mount, e.Mount)
+		case !types[PluginTypeSecret]:
+			return fmt.Errorf("engineConfigs[%d] (%s): engine config applies to secret mounts only", i, e.Mount)
+		}
+		path, err := normSubPath("path", e.Path, DefaultEngineConfigPath)
+		if err != nil {
+			return fmt.Errorf("engineConfigs[%d] (%s): %w", i, e.Mount, err)
+		}
+		e.Mount, e.Path = mount, path
+
+		key := mount + "/" + path
+		if seen[key] {
+			return fmt.Errorf("engineConfigs[%d] (%s): duplicate engine config for %q", i, e.Mount, key)
+		}
+		seen[key] = true
+
+		for j := range s.Roles {
+			r := s.Roles[j]
+			if normMountPath(r.Mount) == mount && (path == r.RolesPath || strings.HasPrefix(path, r.RolesPath+"/")) {
+				return fmt.Errorf("engineConfigs[%d] (%s): path %q overlaps rolesPath %q of roles[%d]", i, e.Mount, path, r.RolesPath, j)
+			}
+		}
+
+		if e.Data == nil && e.SecretRef == nil {
+			return fmt.Errorf("engineConfigs[%d] (%s): one of data or secretRef is required", i, e.Mount)
+		}
+		if ref := e.SecretRef; ref != nil {
+			switch {
+			case ref.Name == "":
+				return fmt.Errorf("engineConfigs[%d] (%s): secretRef.name is required", i, e.Mount)
+			case len(ref.Keys) == 0:
+				return fmt.Errorf("engineConfigs[%d] (%s): secretRef.keys must name at least one field", i, e.Mount)
+			}
+			fields := make([]string, 0, len(ref.Keys))
+			for field := range ref.Keys {
+				fields = append(fields, field)
+			}
+			sort.Strings(fields)
+			for _, field := range fields {
+				if _, dup := e.Data[field]; dup {
+					return fmt.Errorf("engineConfigs[%d] (%s): field %q is set in both data and secretRef.keys", i, e.Mount, field)
+				}
+			}
+		}
+		if err := validateEngineData(e.Data); err != nil {
+			return fmt.Errorf("engineConfigs[%d] (%s): %w", i, e.Mount, err)
+		}
+	}
+	return nil
+}
+
+// validateEngineData rejects values that would not reach Vault as written: an
+// unquoted YAML timestamp decodes to time.Time and a .nan/.inf to a non-finite
+// float. The error names the top-level field. json.Marshal is the backstop for
+// anything else that cannot be encoded.
+func validateEngineData(data map[string]any) error {
+	fields := make([]string, 0, len(data))
+	for k := range data {
+		fields = append(fields, k)
+	}
+	sort.Strings(fields)
+	for _, k := range fields {
+		if err := checkEngineValue(data[k]); err != nil {
+			return fmt.Errorf("data field %q: %w", k, err)
+		}
+	}
+	if _, err := json.Marshal(data); err != nil {
+		return fmt.Errorf("data is not JSON-encodable: %w", err)
+	}
+	return nil
+}
+
+func checkEngineValue(v any) error {
+	switch x := v.(type) {
+	case time.Time:
+		return fmt.Errorf("unquoted timestamp %s decodes as a date; quote the value to keep it a string", x.Format(time.RFC3339))
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return fmt.Errorf("value %v is not a finite number", x)
+		}
+	case map[string]any:
+		for _, e := range x {
+			if err := checkEngineValue(e); err != nil {
+				return err
+			}
+		}
+	case map[any]any:
+		for _, e := range x {
+			if err := checkEngineValue(e); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if err := checkEngineValue(e); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -93,25 +217,25 @@ func (s *Spec) Validate() error {
 // reproduces the classic <mount>/roles/<name> layout.
 const DefaultRolesPath = "roles"
 
-// normRolesPath defaults, trims, and validates a RoleEntry.RolesPath. An omitted
-// (empty) value becomes DefaultRolesPath. Otherwise surrounding slashes are
+// normSubPath defaults, trims, and validates a subpath field (rolesPath, path).
+// An omitted (empty) value becomes def. Otherwise surrounding slashes are
 // trimmed and the result is rejected if it trims to empty (e.g. "/"), or
-// contains an empty segment (e.g. "a//b") or a "." or ".." segment — kept
+// contains an empty segment (e.g. "a//b") or a "." or ".." segment, kept
 // generic so vpm stays plugin-agnostic.
-func normRolesPath(p string) (string, error) {
+func normSubPath(field, p, def string) (string, error) {
 	if p == "" {
-		return DefaultRolesPath, nil
+		return def, nil
 	}
 	trimmed := strings.Trim(p, "/")
 	if trimmed == "" {
-		return "", fmt.Errorf("rolesPath %q must not be empty after trimming slashes", p)
+		return "", fmt.Errorf("%s %q must not be empty after trimming slashes", field, p)
 	}
 	for _, seg := range strings.Split(trimmed, "/") {
 		switch seg {
 		case "":
-			return "", fmt.Errorf("rolesPath %q must not contain an empty segment", p)
+			return "", fmt.Errorf("%s %q must not contain an empty segment", field, p)
 		case ".", "..":
-			return "", fmt.Errorf("rolesPath %q must not contain a %q segment", p, seg)
+			return "", fmt.Errorf("%s %q must not contain a %q segment", field, p, seg)
 		}
 	}
 	return trimmed, nil
