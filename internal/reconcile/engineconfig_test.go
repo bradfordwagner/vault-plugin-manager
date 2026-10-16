@@ -9,6 +9,10 @@ import (
 	"strings"
 	"testing"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
 	"vault-plugin-manager/internal/config"
 	"vault-plugin-manager/internal/vault"
 )
@@ -94,6 +98,13 @@ func (g *ecRig) records(t *testing.T) map[string]engineConfigRecord {
 		t.Fatalf("decoding state: %v", err)
 	}
 	return out
+}
+
+// observeLogs swaps the reconciler's logger for one that records every entry.
+func (g *ecRig) observeLogs() *observer.ObservedLogs {
+	core, logs := observer.New(zapcore.DebugLevel)
+	g.r.log = zap.New(core).Sugar().With("component", "reconcile")
+	return logs
 }
 
 func count(s []string, want string) int {
@@ -506,6 +517,7 @@ func TestEngineConfigMountUUIDsValidatedBeforeAnyWrite(t *testing.T) {
 
 func TestEngineConfigStateSaveConflictFailsThePass(t *testing.T) {
 	g := newECRig(map[string][]byte{"pem": []byte("KEY1")})
+	g.secrets.secrets[testConfig().StateSecretName] = stateDoc(`{}`)
 	g.secrets.putErr = errors.New("conflict: the object has been modified")
 	spec := ecSpec(t, config.PruneNever, ecGithub)
 
@@ -599,5 +611,102 @@ func TestEngineConfigNoEntriesNoStateSecretIsNoop(t *testing.T) {
 	}
 	if got := g.secrets.gets[testConfig().StateSecretName]; got != 1 {
 		t.Errorf("state Secret read %d times, want once per pass", got)
+	}
+}
+
+func TestEngineConfigNoEntriesUnreadableStateSkips(t *testing.T) {
+	state := testConfig().StateSecretName
+	cases := map[string]func(s *fakeSecrets){
+		"read error": func(s *fakeSecrets) {
+			s.getErr = map[string]error{state: errors.New(`secrets "vpm-state" is forbidden: cannot get resource "secrets"`)}
+		},
+		"not json": func(s *fakeSecrets) { s.secrets[state] = stateDoc("not json") },
+	}
+	for name, seed := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := newECRig(nil)
+			seed(g.secrets)
+			logs := g.observeLogs()
+			if err := g.pass(ecSpec(t, config.PruneNever, "roles:\n  - {mount: github, name: r}\n")); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if len(g.secrets.puts) != 0 {
+				t.Errorf("puts = %v, want none", g.secrets.puts)
+			}
+			ranRole := false
+			for _, c := range g.fv.calls {
+				ranRole = ranRole || strings.HasPrefix(c, "role:")
+			}
+			if !ranRole {
+				t.Errorf("roles did not run; calls=%v", g.fv.calls)
+			}
+			warns := logs.FilterLevelExact(zapcore.WarnLevel).All()
+			if len(warns) != 1 {
+				t.Fatalf("logged %d warnings, want 1", len(warns))
+			}
+			if fields := warns[0].ContextMap(); fields["secret"] != "vault/"+state || fields["component"] != "reconcile" {
+				t.Errorf("warning fields = %v, want secret vault/%s and component reconcile", fields, state)
+			}
+		})
+	}
+}
+
+func TestEngineConfigCreatesStateBeforeFirstWrite(t *testing.T) {
+	g := newECRig(map[string][]byte{"pem": []byte("KEY1")})
+	g.secrets.oplog = &g.fv.calls
+	state := testConfig().StateSecretName
+	g.mustPass(t, ecSpec(t, config.PruneNever, ecGithub))
+
+	create, write := indexOf(g.fv.calls, "put:"+state+"@"), indexOf(g.fv.calls, "config:github/config")
+	if create < 0 || write < 0 || create > write {
+		t.Fatalf("want the state Secret created before the write; calls=%v", g.fv.calls)
+	}
+	want := []fakePut{{name: state, rv: ""}, {name: state, rv: "1"}}
+	if !reflect.DeepEqual(g.secrets.puts, want) {
+		t.Errorf("puts = %v, want a create then an update carrying its resourceVersion", g.secrets.puts)
+	}
+	if _, ok := g.records(t)["github/config"]; !ok {
+		t.Error("no record for github/config")
+	}
+}
+
+func TestEngineConfigPersistentCreateFailureWritesNothing(t *testing.T) {
+	g := newECRig(map[string][]byte{"pem": []byte("KEY1")})
+	g.secrets.putErr = errors.New(`secrets is forbidden: cannot create resource "secrets"`)
+	spec := ecSpec(t, config.PruneNever, ecGithub)
+	for i := 1; i <= 3; i++ {
+		if err := g.pass(spec); err == nil {
+			t.Fatalf("pass %d: expected the create error", i)
+		}
+	}
+	for _, c := range g.fv.calls {
+		if strings.HasPrefix(c, "config:") {
+			t.Fatalf("wrote Vault without a state Secret; calls=%v", g.fv.calls)
+		}
+	}
+}
+
+func TestEngineConfigLogsWriteReason(t *testing.T) {
+	g := newECRig(map[string][]byte{"pem": []byte("KEY1")})
+	logs := g.observeLogs()
+	spec := ecSpec(t, config.PruneNever, ecGithub)
+
+	g.mustPass(t, spec)
+	g.fv.uuids["github"] = "u-2"
+	g.mustPass(t, spec)
+	g.secrets.secrets["creds"] = map[string][]byte{"pem": []byte("KEY2")}
+	g.mustPass(t, spec)
+
+	var got []string
+	for _, e := range logs.FilterMessage("wrote engine config").All() {
+		f := e.ContextMap()
+		if f["mount"] != "github" || f["path"] != "config" {
+			t.Errorf("fields = %v, want mount github and path config", f)
+		}
+		got = append(got, f["reason"].(string))
+	}
+	want := []string{"unrecorded", "mount_recreated", "changed"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("reasons = %v, want %v", got, want)
 	}
 }

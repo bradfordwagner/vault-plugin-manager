@@ -61,6 +61,14 @@ func (r *Reconciler) reconcileEngineConfigs(ctx context.Context, spec *config.Sp
 func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, values *[]string) error {
 	records, rv, err := r.loadEngineConfigState(ctx)
 	if err != nil {
+		if len(spec.EngineConfigs) == 0 {
+			// Nothing is declared, so there is nothing to protect: an unreadable
+			// state Secret must not stop roles and pruning for a deployment that
+			// does not use engine configs.
+			r.log.With("secret", r.stateSecretRef(), "error", scrubSecrets(err, *values).Error()).
+				Warn("engine config state Secret is unusable; skipping the engine config step")
+			return nil
+		}
 		return err
 	}
 	entries, err := r.resolveEngineConfigs(ctx, spec.EngineConfigs, values)
@@ -72,21 +80,33 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 		return err
 	}
 
+	type pendingWrite struct {
+		entry  resolvedEngineConfig
+		reason string
+	}
+	var pending []pendingWrite
+	for _, e := range entries {
+		if reason := writeReason(records[e.key], e.digest, uuids[e.mount]); reason != "" {
+			pending = append(pending, pendingWrite{e, reason})
+		}
+	}
+
+	// Create the state Secret before the first Vault write, so a Secret that
+	// cannot be created fails the pass with nothing written instead of
+	// rewriting Vault every pass with nothing recorded.
+	if rv == "" && len(pending) > 0 {
+		created, err := r.secrets.PutSecretData(ctx, r.cfg.SecretNamespace, r.cfg.StateSecretName, "",
+			map[string][]byte{engineConfigStateKey: []byte("{}")})
+		if err != nil {
+			return fmt.Errorf("reconcile: creating engine config state Secret %s: %w", r.stateSecretRef(), err)
+		}
+		rv = created
+	}
+
 	dirty := false
 	var writeErr error
-	for _, e := range entries {
-		uuid := uuids[e.mount]
-		var reason string
-		switch rec := records[e.key]; {
-		case rec == nil:
-			reason = reasonUnrecorded
-		case rec.MountUUID != uuid:
-			reason = reasonMountRecreated
-		case rec.SHA256 != e.digest:
-			reason = reasonChanged
-		default:
-			continue
-		}
+	for _, p := range pending {
+		e := p.entry
 		err := r.vault.WriteEngineConfig(ctx, e.key, e.body)
 		wrote := err == nil
 		metrics.VaultActionIf(metrics.ActionEngineConfig, wrote, err)
@@ -96,8 +116,8 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 			writeErr = fmt.Errorf("reconcile: engine config %s: %w", e.key, err)
 			break
 		}
-		r.log.With("mount", e.mount, "path", e.path, "reason", reason).Info("wrote engine config")
-		records[e.key] = &engineConfigRecord{SHA256: e.digest, MountUUID: uuid}
+		r.log.With("mount", e.mount, "path", e.path, "reason", p.reason).Info("wrote engine config")
+		records[e.key] = &engineConfigRecord{SHA256: e.digest, MountUUID: uuids[e.mount]}
 		dirty = true
 	}
 
@@ -120,6 +140,21 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 	return errors.Join(writeErr, saveErr)
 }
 
+// writeReason is why an entry with this digest on the mount with this UUID
+// needs a write given its record, or "" when the record is current.
+func writeReason(rec *engineConfigRecord, digest, uuid string) string {
+	switch {
+	case rec == nil:
+		return reasonUnrecorded
+	case rec.MountUUID != uuid:
+		return reasonMountRecreated
+	case rec.SHA256 != digest:
+		return reasonChanged
+	default:
+		return ""
+	}
+}
+
 // stateSecretRef names the state Secret in errors.
 func (r *Reconciler) stateSecretRef() string {
 	return r.cfg.SecretNamespace + "/" + r.cfg.StateSecretName
@@ -127,7 +162,7 @@ func (r *Reconciler) stateSecretRef() string {
 
 // loadEngineConfigState reads the recorded writes and the state Secret's
 // resourceVersion. Only a missing Secret is empty state (rv ""); every other
-// unusable outcome fails closed, since treating it as empty would rewrite
+// unusable outcome is an error, since treating it as empty would rewrite
 // every entry and reseed credentials a rotating engine has replaced.
 func (r *Reconciler) loadEngineConfigState(ctx context.Context) (map[string]*engineConfigRecord, string, error) {
 	data, rv, err := r.secrets.GetSecretData(ctx, r.cfg.SecretNamespace, r.cfg.StateSecretName)
@@ -228,8 +263,8 @@ func (r *Reconciler) engineConfigMountUUIDs(ctx context.Context, entries []resol
 	return uuids, nil
 }
 
-// saveEngineConfigState writes records back: an update guarded by rv, or a
-// create when rv is "".
+// saveEngineConfigState writes records back as an update guarded by rv. The
+// state Secret exists by then: a missing one is created before the first write.
 func (r *Reconciler) saveEngineConfigState(ctx context.Context, rv string, records map[string]*engineConfigRecord) error {
 	raw, err := json.Marshal(records)
 	if err != nil {

@@ -184,6 +184,9 @@ type fakeSecrets struct {
 	putErr error
 	puts   []fakePut
 	bumps  map[string]int // puts per name, for the resourceVersion
+	// oplog, when set, gets "put:<name>@<rv>" for every put, so a test can
+	// order puts against the Vault fake's calls by pointing it there.
+	oplog *[]string
 }
 
 // fakePut records one PutSecretData call.
@@ -216,6 +219,9 @@ func (f *fakeSecrets) GetSecretData(_ context.Context, ns, name string) (map[str
 
 func (f *fakeSecrets) PutSecretData(_ context.Context, _, name, resourceVersion string, data map[string][]byte) (string, error) {
 	f.puts = append(f.puts, fakePut{name: name, rv: resourceVersion})
+	if f.oplog != nil {
+		*f.oplog = append(*f.oplog, "put:"+name+"@"+resourceVersion)
+	}
 	if f.putErr != nil {
 		return "", f.putErr
 	}
