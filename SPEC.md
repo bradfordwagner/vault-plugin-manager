@@ -157,6 +157,9 @@ body, never a partial update.
   Role pruning under `pruneMode: full` lists every declared `rolesPath` and
   deletes what the spec does not name, so an engine config there would be deleted
   as an undeclared role. This also keeps the two sections from writing one path.
+- `data` values must be JSON-encodable: an unquoted YAML timestamp (which decodes
+  to a date, not a string) and a non-finite number (`.nan`, `.inf`) are rejected
+  with the field named. Quote the value to keep it a string.
 
 `roles` still rejects a role named `config`: engine config is written only
 through this section, and only on a content change.
@@ -170,18 +173,25 @@ rewrite with the seeded value breaks them. Each pass therefore:
 1. Reads the state Secret (§3a "State"). Only NotFound means no writes are
    recorded. Every other outcome **fails closed**: a read error (403, timeout,
    apiserver down), a Secret without the `engine-configs.json` key, JSON that does
-   not decode, or a record missing its digest or mount UUID fails the pass here,
-   with nothing written. Treating any of these as empty state would rewrite every
+   not decode, a `null` document or `null` record, or a record missing its digest
+   or mount UUID fails the pass here, with nothing written. `{}` is valid empty
+   state. Treating any of these as empty state would rewrite every
    entry from the ConfigMap, reseeding credentials a rotating engine has already
    replaced. The way out is to fix the Secret or delete it, which is an explicit
    request for a rewrite.
-2. Resolves every entry before writing any: GETs each `secretRef` Secret and
-   builds the body. A missing Secret or key fails the pass here, with nothing
-   written, like any other reconcile error: catalog and mounts have already
-   converged, roles and pruning wait.
+2. Resolves every entry before writing any: GETs each distinct `secretRef` Secret
+   once per pass, and every entry resolves from that snapshot. A missing Secret or
+   key fails the pass here, with nothing written, like any other reconcile error:
+   catalog and mounts have already converged, roles and pruning wait. An empty or
+   non-UTF-8 Secret value fails the pass the same way as a missing key. This is a
+   deliberate restriction: a plugin field whose legitimate value is the empty
+   string cannot be sourced from a Secret, and goes in `data` instead. Values are
+   written verbatim, with no trimming.
 3. Reads the live UUID of each referenced mount from `sys/mounts`. Vault assigns a
    new UUID whenever a mount is enabled, so a mount that was disabled and
    re-enabled (by vpm or anyone else) is recognizable even though its path is not.
+   Every referenced mount must be present with a non-empty UUID before any write,
+   so an empty UUID is never recorded.
 4. For each entry, computes `sha256` over the canonical JSON of
    `{vault path, body}`. When both the digest and the mount UUID equal the
    recorded ones the entry is skipped; otherwise vpm writes the body to
@@ -237,7 +247,10 @@ rewrite on the next pass.
 `path` and `reason` (`unrecorded` when there was no record, `mount_recreated`
 when the mount UUID moved, `changed` otherwise), never values. It counts as the
 `engine_config` action through `metrics.VaultActionIf`, so steady state is flat.
-`vpm_spec_entries` carries `kind=engineConfigs`. The ConfigMap change log keys
+A failed Vault write reports only the path and the HTTP status, never Vault's
+response body: a plugin may echo, partially or transformed, the values it was
+sent. Every other error from the step is scrubbed of the resolved Secret values
+before it is returned or logged. `vpm_spec_entries` carries `kind=engineConfigs`. The ConfigMap change log keys
 entries as `mount/path` and reports which `data` keys and which `secretRef`
 fields moved, never values; a Secret content change is not a ConfigMap change and
 shows up only as the write.

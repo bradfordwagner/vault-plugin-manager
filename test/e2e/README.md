@@ -17,6 +17,10 @@
 6. Asserts: both plugins registered, both mounts enabled, and `write`/`read` of a
    secret works through each. Then removes the OCI entry and asserts prune
    disabled the mount + deregistered the version while the HTTPS mount survived.
+7. Exercises `engineConfigs`: the config is written from literal `data` plus a
+   Secret value, a rotated Secret value is rewritten, a recreated mount gets its
+   config back, a manager restart does not rewrite it, and removing the entry
+   leaves Vault untouched while dropping its record from the state Secret.
 
 ## How it fits together
 
