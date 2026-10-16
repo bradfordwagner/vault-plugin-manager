@@ -84,6 +84,20 @@ metrics:
 # registry used for testing). Leave false in production.
 ociInsecure: false
 
+# Name of the Secret where the manager records the digest of each engine config
+# it last wrote, so a restart does not rewrite them. Empty = <fullname>-state.
+# The Role always grants get/update on exactly this Secret.
+stateSecretName: ""
+
+engineConfigs:
+  # When true, the Role also grants `create` on Secrets (to make the state Secret
+  # on the first engine config write) and `get` on each of secretNames. Leave
+  # false if the spec declares no engineConfigs.
+  enabled: false
+  # Names of the Secrets that spec.engineConfigs[].secretRef.name points at. The
+  # Role grants `get` on exactly these, in the release namespace.
+  secretNames: []
+
 configMap:
   # Name of the ConfigMap the manager watches. Empty namespace = release namespace.
   name: vault-plugins
@@ -127,6 +141,21 @@ configMap:
       watchGracePeriod: 2m
     catalog: []
     mounts: []
+    # engineConfigs: write a plugin's config endpoint (<mount>/<path>) from
+    # literal `data` plus values read from a Secret in this namespace, only when
+    # that content changes. The Secret must also be listed in the chart value
+    # engineConfigs.secretNames so the manager may read it.
+    #
+    #   engineConfigs:
+    #     - mount: example              # references a mounts[].path
+    #       path: config                # optional; default `config`
+    #       data:                       # non-secret literal fields, written as-is
+    #         app_id: 4627856
+    #       secretRef:                  # optional
+    #         name: example-engine-credentials
+    #         keys:                     # <vault field>: <secret data key>
+    #           prv_key: private-key.pem
+    engineConfigs: []
     # roles: secret-engine role bodies to UPSERT at <mount>/<rolesPath>/<name>.
     # `data` is written verbatim to the plugin (vpm is schema-agnostic). Under
     # pruneMode `full`, roles under a declared rolesPath on a managed mount that
