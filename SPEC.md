@@ -167,7 +167,14 @@ GitHub engine returns `prv_key: <configured>`), and some engines rotate a seeded
 credential and purge the original (the Keycloak engine's `client_secret`), so a
 rewrite with the seeded value breaks them. Each pass therefore:
 
-1. Reads the state Secret (§3a "State"). NotFound means no writes are recorded.
+1. Reads the state Secret (§3a "State"). Only NotFound means no writes are
+   recorded. Every other outcome **fails closed**: a read error (403, timeout,
+   apiserver down), a Secret without the `engine-configs.json` key, JSON that does
+   not decode, or a record missing its digest or mount UUID fails the pass here,
+   with nothing written. Treating any of these as empty state would rewrite every
+   entry from the ConfigMap, reseeding credentials a rotating engine has already
+   replaced. The way out is to fix the Secret or delete it, which is an explicit
+   request for a rewrite.
 2. Resolves every entry before writing any: GETs each `secretRef` Secret and
    builds the body. A missing Secret or key fails the pass here, with nothing
    written, like any other reconcile error: catalog and mounts have already
@@ -192,10 +199,20 @@ rewrite with the seeded value breaks them. Each pass therefore:
 Referenced Secrets are read on every pass, not watched: a rotated Secret value is
 applied within `resyncInterval`. A ConfigMap edit still reconciles immediately.
 
-**Ordering.** vpm writes Vault first and records the digest second. A crash, or a
-failed state save, between the two rewrites the same content on the next pass.
-That is harmless for an engine whose config is static (GitHub), and only matters
-for a rotating engine if the rotation happened inside that window.
+**Ordering and delivery.** vpm writes Vault first and records the digest second,
+so writes are **at least once, not exactly once**. Three cases rewrite content
+Vault may already hold on the next pass:
+
+- a crash between the Vault write and the state save;
+- a failed state save;
+- a write that returns an error but landed anyway (a client timeout or dropped
+  connection after Vault accepted it). vpm cannot tell this from a write that
+  failed, so it records nothing and the next pass writes again.
+
+A rewrite is harmless for an engine whose config is static (GitHub). For a
+rotating engine it reseeds the original credential only if the engine rotated in
+between, which in the third case means within one `resyncInterval` of the
+ambiguous write.
 
 **Adoption.** An entry with no record is written on the first pass that sees it.
 Moving an already-configured engine under `engineConfigs` therefore overwrites
@@ -481,5 +498,6 @@ chart/                           # Helm chart
   but a config edited in place in Vault stays edited until the spec or Secret
   content changes or its record is deleted from the state Secret. Secret fields read back redacted, so there is no
   live value to compare against.
-- **Engine config crash window.** A crash between the Vault write and the state
-  save rewrites the same body on the next pass (§3a "Ordering").
+- **Engine config writes are at least once.** A crash or failed state save after
+  the Vault write, or a write whose error hides that Vault accepted it, rewrites
+  the same body on the next pass (§3a "Ordering and delivery").
