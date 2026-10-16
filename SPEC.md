@@ -210,9 +210,10 @@ Vault may already hold on the next pass:
   failed, so it records nothing and the next pass writes again.
 
 A rewrite is harmless for an engine whose config is static (GitHub). For a
-rotating engine it reseeds the original credential only if the engine rotated in
-between, which in the third case means within one `resyncInterval` of the
-ambiguous write.
+rotating engine it reseeds the original credential if the engine rotated before
+the rewrite lands. That window lasts until the next pass that reaches the write,
+which is not bounded by `resyncInterval`: a Vault outage, a manager restart, or
+earlier reconcile steps failing all delay it.
 
 **Adoption.** An entry with no record is written on the first pass that sees it.
 Moving an already-configured engine under `engineConfigs` therefore overwrites
