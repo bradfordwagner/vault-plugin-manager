@@ -61,20 +61,22 @@ const (
 // Vault actions recorded on the action label of VaultAction. Reads
 // (ListManagedMounts, ListRoles) are not actions and are not counted.
 const (
-	ActionRegister   = "register"
-	ActionDeregister = "deregister"
-	ActionMount      = "mount"
-	ActionUnmount    = "unmount"
-	ActionReload     = "reload"
-	ActionRoleUpsert = "role_upsert"
-	ActionRoleDelete = "role_delete"
+	ActionRegister     = "register"
+	ActionDeregister   = "deregister"
+	ActionMount        = "mount"
+	ActionUnmount      = "unmount"
+	ActionReload       = "reload"
+	ActionRoleUpsert   = "role_upsert"
+	ActionRoleDelete   = "role_delete"
+	ActionEngineConfig = "engine_config"
 )
 
 // Kinds counted by the spec_entries gauge.
 const (
-	KindCatalog = "catalog"
-	KindMounts  = "mounts"
-	KindRoles   = "roles"
+	KindCatalog       = "catalog"
+	KindMounts        = "mounts"
+	KindRoles         = "roles"
+	KindEngineConfigs = "engineConfigs"
 )
 
 var (
@@ -161,6 +163,7 @@ func init() {
 	for _, action := range []string{
 		ActionRegister, ActionDeregister, ActionMount,
 		ActionUnmount, ActionReload, ActionRoleUpsert, ActionRoleDelete,
+		ActionEngineConfig,
 	} {
 		for _, result := range []string{ResultSuccess, ResultError} {
 			vaultActions.WithLabelValues(action, result)
@@ -286,8 +289,9 @@ func VaultActionIf(action string, changed bool, err error) {
 }
 
 // SpecEntries records the size of the parsed spec.
-func SpecEntries(catalog, mounts, roles int) {
+func SpecEntries(catalog, mounts, roles, engineConfigs int) {
 	specEntries.WithLabelValues(KindCatalog).Set(float64(catalog))
 	specEntries.WithLabelValues(KindMounts).Set(float64(mounts))
 	specEntries.WithLabelValues(KindRoles).Set(float64(roles))
+	specEntries.WithLabelValues(KindEngineConfigs).Set(float64(engineConfigs))
 }
