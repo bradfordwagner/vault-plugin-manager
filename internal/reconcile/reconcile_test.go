@@ -2,10 +2,13 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"testing"
 
 	"vault-plugin-manager/internal/config"
 	"vault-plugin-manager/internal/fetch"
+	"vault-plugin-manager/internal/k8s"
 	"vault-plugin-manager/internal/vault"
 )
 
@@ -76,6 +79,12 @@ type fakeVault struct {
 	// read-compare-write, and a fake that always reports changed cannot catch a
 	// counter wired above the changed branch.
 	live map[string]bool
+
+	// Engine config recording.
+	uuids        map[string]string         // SecretMountUUIDs result, keyed by mount
+	configWrites []string                  // path per successful WriteEngineConfig
+	configBodies map[string]map[string]any // last body written per path
+	writeErr     map[string]error          // WriteEngineConfig error per path
 }
 
 // wrote records key and reports whether this call is the one that wrote it.
@@ -137,6 +146,101 @@ func (f *fakeVault) DeleteRole(_ context.Context, mount, rolesPath, name string)
 	return nil
 }
 
+func (f *fakeVault) SecretMountUUIDs(_ context.Context) (map[string]string, error) {
+	out := make(map[string]string, len(f.uuids))
+	for k, v := range f.uuids {
+		out[k] = v
+	}
+	return out, nil
+}
+func (f *fakeVault) WriteEngineConfig(_ context.Context, path string, body map[string]any) error {
+	f.calls = append(f.calls, "config:"+path)
+	if err := f.writeErr[path]; err != nil {
+		return err
+	}
+	f.configWrites = append(f.configWrites, path)
+	if f.configBodies == nil {
+		f.configBodies = map[string]map[string]any{}
+	}
+	cp := make(map[string]any, len(body))
+	for k, v := range body {
+		cp[k] = v
+	}
+	f.configBodies[path] = cp
+	return nil
+}
+
+// fakeSecrets is a Secret store that behaves like the apiserver on writes: a
+// create of an existing Secret, or an update with a stale resourceVersion,
+// fails. A Secret seeded into secrets reads back at resourceVersion "1", and
+// every put moves it up by one.
+type fakeSecrets struct {
+	secrets map[string]map[string][]byte
+	getErr  map[string]error
+	gets    map[string]int // GET count per name
+	// onGet, when set and returning non-nil, replaces what secrets holds for
+	// that GET, so a test can rotate a value between two reads.
+	onGet  func(name string) map[string][]byte
+	putErr error
+	puts   []fakePut
+	bumps  map[string]int // puts per name, for the resourceVersion
+}
+
+// fakePut records one PutSecretData call.
+type fakePut struct {
+	name string
+	rv   string // resourceVersion the caller passed; "" is a create
+}
+
+func (f *fakeSecrets) rvOf(name string) string { return strconv.Itoa(1 + f.bumps[name]) }
+
+func (f *fakeSecrets) GetSecretData(_ context.Context, ns, name string) (map[string][]byte, string, error) {
+	if f.gets == nil {
+		f.gets = map[string]int{}
+	}
+	f.gets[name]++
+	if err := f.getErr[name]; err != nil {
+		return nil, "", err
+	}
+	if f.onGet != nil {
+		if data := f.onGet(name); data != nil {
+			return data, f.rvOf(name), nil
+		}
+	}
+	data, ok := f.secrets[name]
+	if !ok {
+		return nil, "", fmt.Errorf("secret %s/%s: %w", ns, name, k8s.ErrNotFound)
+	}
+	return data, f.rvOf(name), nil
+}
+
+func (f *fakeSecrets) PutSecretData(_ context.Context, _, name, resourceVersion string, data map[string][]byte) (string, error) {
+	f.puts = append(f.puts, fakePut{name: name, rv: resourceVersion})
+	if f.putErr != nil {
+		return "", f.putErr
+	}
+	_, exists := f.secrets[name]
+	switch {
+	case resourceVersion == "" && exists:
+		return "", fmt.Errorf("secret %s already exists", name)
+	case resourceVersion != "" && !exists:
+		return "", fmt.Errorf("secret %s not found", name)
+	case resourceVersion != "" && resourceVersion != f.rvOf(name):
+		return "", fmt.Errorf("secret %s: conflict: resourceVersion %s is stale", name, resourceVersion)
+	}
+	if f.secrets == nil {
+		f.secrets = map[string]map[string][]byte{}
+	}
+	if f.bumps == nil {
+		f.bumps = map[string]int{}
+	}
+	f.secrets[name] = data
+	if exists {
+		f.bumps[name]++
+	}
+	return f.rvOf(name), nil
+}
+
 func has(s []string, want string) bool {
 	for _, v := range s {
 		if v == want {
@@ -147,7 +251,10 @@ func has(s []string, want string) bool {
 }
 
 func testConfig() Config {
-	return Config{VaultNamespace: "vault", VaultPodSelector: "app=vault", VaultContainer: "vault", PluginDir: "/vault/plugins"}
+	return Config{
+		VaultNamespace: "vault", VaultPodSelector: "app=vault", VaultContainer: "vault", PluginDir: "/vault/plugins",
+		SecretNamespace: "vault", StateSecretName: "vpm-state",
+	}
 }
 
 // --- tests ---
@@ -165,7 +272,7 @@ func TestReconcileHappyPath(t *testing.T) {
 	}
 	pods := &fakePods{pods: []string{"vault-0", "vault-1"}}
 	fv := &fakeVault{}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 
 	if err := r.Reconcile(context.Background(), spec); err != nil {
 		t.Fatal(err)
@@ -195,7 +302,7 @@ func TestReconcilePruneFull(t *testing.T) {
 		{Path: "old", Type: "secret", Plugin: "vault-plugin-secrets-old", Version: "1.0.0"},
 	}}
 	pods := &fakePods{pods: []string{"vault-0"}}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 
 	spec := &config.Spec{Settings: config.Settings{PruneMode: config.PruneFull}}
 	if err := r.Reconcile(context.Background(), spec); err != nil {
@@ -218,7 +325,7 @@ func TestReconcilePruneDeregisterKeepsBinary(t *testing.T) {
 		{Path: "old", Type: "secret", Plugin: "p", Version: "1.0.0"},
 	}}
 	pods := &fakePods{pods: []string{"vault-0"}}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 
 	spec := &config.Spec{Settings: config.Settings{PruneMode: config.PruneDeregister}}
 	if err := r.Reconcile(context.Background(), spec); err != nil {
@@ -238,7 +345,7 @@ func TestReconcilePruneNever(t *testing.T) {
 		{Path: "old", Type: "secret", Plugin: "p", Version: "1.0.0"},
 	}}
 	pods := &fakePods{pods: []string{"vault-0"}}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 
 	spec := &config.Spec{Settings: config.Settings{PruneMode: config.PruneNever}}
 	if err := r.Reconcile(context.Background(), spec); err != nil {
@@ -257,7 +364,7 @@ func TestReconcilePruneKeepsStillDesiredVersion(t *testing.T) {
 		{Path: "old", Type: "secret", Plugin: "p", Version: "1.0.0"},
 	}}
 	pods := &fakePods{pods: []string{"vault-0"}}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 
 	spec := &config.Spec{
 		Settings: config.Settings{PruneMode: config.PruneFull},
@@ -280,7 +387,7 @@ func TestReconcilePruneKeepsStillDesiredVersion(t *testing.T) {
 }
 
 func TestReconcileNoPodsIsError(t *testing.T) {
-	r := New(&fakeVault{}, &fakePods{pods: nil}, fakeFetcher{}, testConfig())
+	r := New(&fakeVault{}, &fakePods{pods: nil}, &fakeSecrets{}, fakeFetcher{}, testConfig())
 	if err := r.Reconcile(context.Background(), &config.Spec{Settings: config.Settings{PruneMode: config.PruneNever}}); err == nil {
 		t.Fatal("expected error when no vault pods are found")
 	}
@@ -313,7 +420,7 @@ func TestReconcileRolesApplied(t *testing.T) {
 	}
 	pods := &fakePods{pods: []string{"vault-0"}}
 	fv := &fakeVault{}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 	if err := r.Reconcile(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +453,7 @@ func TestReconcileRolesEmptyAppliesNothing(t *testing.T) {
 	}
 	pods := &fakePods{pods: []string{"vault-0"}}
 	fv := &fakeVault{}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 	if err := r.Reconcile(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +470,7 @@ func TestReconcileRolesPruneFull(t *testing.T) {
 		rolesByPath: map[string][]string{"foo/roles": {"reader", "writer"}},
 	}
 	pods := &fakePods{pods: []string{"vault-0"}}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 	spec := &config.Spec{
 		Settings: config.Settings{PruneMode: config.PruneFull},
 		Catalog:  []config.CatalogEntry{{Name: "p", Type: config.PluginTypeSecret, Version: "1.0.0", Source: config.Source{URL: "https://x"}}},
@@ -391,7 +498,7 @@ func TestReconcileRolesCustomRolesPath(t *testing.T) {
 		rolesByPath: map[string][]string{"foo/realm/example/roles": {"reader", "old"}},
 	}
 	pods := &fakePods{pods: []string{"vault-0"}}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 	spec := &config.Spec{
 		Settings: config.Settings{PruneMode: config.PruneFull},
 		Catalog:  []config.CatalogEntry{{Name: "p", Type: config.PluginTypeSecret, Version: "1.0.0", Source: config.Source{URL: "https://x"}}},
@@ -425,7 +532,7 @@ func TestReconcileRolesUndeclaredRolesPathNotEnumerated(t *testing.T) {
 		},
 	}
 	pods := &fakePods{pods: []string{"vault-0"}}
-	r := New(fv, pods, fakeFetcher{}, testConfig())
+	r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 	spec := &config.Spec{
 		Settings: config.Settings{PruneMode: config.PruneFull},
 		Catalog:  []config.CatalogEntry{{Name: "p", Type: config.PluginTypeSecret, Version: "1.0.0", Source: config.Source{URL: "https://x"}}},
@@ -452,7 +559,7 @@ func TestReconcileRolesNoPruneUnderNonFull(t *testing.T) {
 				rolesByPath: map[string][]string{"foo/roles": {"reader", "writer"}},
 			}
 			pods := &fakePods{pods: []string{"vault-0"}}
-			r := New(fv, pods, fakeFetcher{}, testConfig())
+			r := New(fv, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 			spec := &config.Spec{
 				Settings: config.Settings{PruneMode: mode},
 				Catalog:  []config.CatalogEntry{{Name: "p", Type: config.PluginTypeSecret, Version: "1.0.0", Source: config.Source{URL: "https://x"}}},
@@ -474,7 +581,7 @@ func TestReconcileRolesNoPruneUnderNonFull(t *testing.T) {
 // logged and counted -- that must leave running instances alone.
 func TestReconcileReloadsOnlyOnVersionMoves(t *testing.T) {
 	fv := &fakeVault{mountResult: &vault.MountResult{Changed: true, Reload: false}}
-	r := New(fv, &fakePods{pods: []string{"vault-0"}}, fakeFetcher{}, testConfig())
+	r := New(fv, &fakePods{pods: []string{"vault-0"}}, &fakeSecrets{}, fakeFetcher{}, testConfig())
 	spec := &config.Spec{
 		Settings: config.Settings{PruneMode: config.PruneNever},
 		Mounts: []config.MountEntry{{

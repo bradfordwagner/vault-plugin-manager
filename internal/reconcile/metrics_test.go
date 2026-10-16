@@ -21,6 +21,7 @@ type counters struct {
 	unmount    float64
 	deregister float64
 	roleUpsert float64
+	engineConf float64
 }
 
 // snapshotCounters reads the collectors back the way an operator would: from
@@ -45,6 +46,7 @@ func snapshotCounters(t *testing.T) counters {
 		unmount:    action(metrics.ActionUnmount),
 		deregister: action(metrics.ActionDeregister),
 		roleUpsert: action(metrics.ActionRoleUpsert),
+		engineConf: action(metrics.ActionEngineConfig),
 	}
 }
 
@@ -61,7 +63,7 @@ func TestReconcileRecordsCopiesAndVaultActions(t *testing.T) {
 	}
 	// Two pods: the copy counter counts per pod placement, not per plugin.
 	pods := &fakePods{pods: []string{"vault-0", "vault-1"}}
-	r := New(&fakeVault{}, pods, fakeFetcher{}, testConfig())
+	r := New(&fakeVault{}, pods, &fakeSecrets{}, fakeFetcher{}, testConfig())
 
 	before := snapshotCounters(t)
 	if err := r.Reconcile(context.Background(), spec); err != nil {
@@ -91,7 +93,7 @@ func TestPruneRecordsVaultActions(t *testing.T) {
 	fv := &fakeVault{managed: []vault.ManagedMount{{
 		Path: "gone", Type: "secret", Plugin: "vault-plugin-secrets-gone", Version: "0.1.0",
 	}}}
-	r := New(fv, &fakePods{pods: []string{"vault-0"}}, fakeFetcher{}, testConfig())
+	r := New(fv, &fakePods{pods: []string{"vault-0"}}, &fakeSecrets{}, fakeFetcher{}, testConfig())
 	spec := &config.Spec{Settings: config.Settings{PruneMode: config.PruneFull}}
 
 	before := snapshotCounters(t)
@@ -126,15 +128,20 @@ func TestReconcileSteadyStateRecordsNoVaultActions(t *testing.T) {
 		Roles: []config.RoleEntry{
 			{Mount: "s", RolesPath: "roles", Name: "reader", Data: map[string]any{"ttl": "1h"}},
 		},
+		EngineConfigs: []config.EngineConfigEntry{{
+			Mount: "s", Path: "config", Data: map[string]any{"app_id": 4627856},
+			SecretRef: &config.SecretRef{Name: "creds", Keys: map[string]string{"prv_key": "pem"}},
+		}},
 	}
-	fv := &fakeVault{}
+	fv := &fakeVault{uuids: map[string]string{"s": "u-s"}}
+	secrets := &fakeSecrets{secrets: map[string]map[string][]byte{"creds": {"pem": []byte("KEY1")}}}
 	// Live roles must include the declared one, or the prune pass has nothing to
 	// list; it must not be deleted either, since the spec declares it.
 	fv.rolesByPath = map[string][]string{"s/roles": {"reader"}}
 	fv.managed = []vault.ManagedMount{{
 		Path: "s", Type: "secret", Plugin: "vault-plugin-secrets-steady", Version: "0.1.0",
 	}}
-	r := New(fv, &fakePods{pods: []string{"vault-0"}}, fakeFetcher{}, testConfig())
+	r := New(fv, &fakePods{pods: []string{"vault-0"}}, secrets, fakeFetcher{}, testConfig())
 
 	if err := r.Reconcile(context.Background(), spec); err != nil {
 		t.Fatalf("first pass: %v", err)
@@ -157,6 +164,7 @@ func TestReconcileSteadyStateRecordsNoVaultActions(t *testing.T) {
 		{"role_upsert", after.roleUpsert - before.roleUpsert},
 		{"unmount", after.unmount - before.unmount},
 		{"deregister", after.deregister - before.deregister},
+		{"engine_config", after.engineConf - before.engineConf},
 	} {
 		if tc.got != 0 {
 			t.Errorf("%s: recorded %v on an unchanged spec, want 0", tc.name, tc.got)
@@ -173,7 +181,7 @@ func TestReconcileRecordsRoleUpsert(t *testing.T) {
 			{Mount: "r", RolesPath: "roles", Name: "two", Data: map[string]any{"ttl": "2h"}},
 		},
 	}
-	r := New(&fakeVault{}, &fakePods{pods: []string{"vault-0"}}, fakeFetcher{}, testConfig())
+	r := New(&fakeVault{}, &fakePods{pods: []string{"vault-0"}}, &fakeSecrets{}, fakeFetcher{}, testConfig())
 
 	before := snapshotCounters(t)
 	if err := r.Reconcile(context.Background(), spec); err != nil {

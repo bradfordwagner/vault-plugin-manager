@@ -18,6 +18,10 @@ type ServeArgs struct {
 	ConfigMapNamespace string `mapstructure:"CONFIGMAP_NAMESPACE"` // defaults to own namespace
 	ConfigMapKey       string `mapstructure:"CONFIGMAP_KEY"`       // data key holding the plugin spec
 
+	// StateSecretName is the vpm-owned Secret, in ConfigMapNamespace, recording
+	// the digest and mount UUID of each engine config written.
+	StateSecretName string `mapstructure:"STATE_SECRET_NAME"`
+
 	// Vault pod discovery + exec-copy
 	VaultPodSelector string `mapstructure:"VAULT_POD_SELECTOR"` // label selector for Vault pods
 	VaultNamespace   string `mapstructure:"VAULT_NAMESPACE"`    // namespace Vault runs in

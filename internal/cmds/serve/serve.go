@@ -84,7 +84,8 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 	}
 	l.Info("authenticated to Vault via Kubernetes auth")
 
-	// Kubernetes client for ConfigMap watching, Vault pod discovery, and exec-copy.
+	// Kubernetes client for ConfigMap watching, Vault pod discovery, exec-copy,
+	// and the Secrets the engine config step reads and records its writes in.
 	kc, err := k8s.New()
 	if err != nil {
 		return fmt.Errorf("building Kubernetes client: %w", err)
@@ -92,11 +93,13 @@ func Run(ctx context.Context, a args.ServeArgs) error {
 	l.Info("kubernetes client initialized")
 
 	// Reconciler + runner: watch the ConfigMap and drive Vault toward it.
-	rec := reconcile.New(vc, kc, fetch.NewClient(fetch.WithInsecureOCI(a.OCIInsecure)), reconcile.Config{
+	rec := reconcile.New(vc, kc, kc, fetch.NewClient(fetch.WithInsecureOCI(a.OCIInsecure)), reconcile.Config{
 		VaultNamespace:   a.VaultNamespace,
 		VaultPodSelector: a.VaultPodSelector,
 		VaultContainer:   a.VaultContainer,
 		PluginDir:        a.PluginDir,
+		SecretNamespace:  a.ConfigMapNamespace,
+		StateSecretName:  a.StateSecretName,
 	})
 	runner := reconcile.NewRunner(rec, kc, a.ConfigMapNamespace, a.ConfigMapName, a.ConfigMapKey, hs)
 
