@@ -15,11 +15,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Latest patch of the three most-recent community minor lines.
-        vault:
-          - "1.21.4"
-          - "2.0.4"
-          - "2.1.1"
+        # Latest patch of the three most-recent community minor lines. Renovate
+        # keeps the window current via .github/renovate/version-matrix.mjs.
+        # renovate: datasource=docker depName=hashicorp/vault
+        vault: ['2.1.1', '2.0.4', '1.21.4']
     name: "vault ${{ matrix.vault }}"
     steps:
       - uses: actions/checkout@v4
