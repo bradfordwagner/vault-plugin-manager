@@ -22,7 +22,7 @@ RUN go build -trimpath \
 # --- CA certificates -------------------------------------------------------
 # Provides an up-to-date CA bundle for the scratch variant (and refreshes the
 # alpine variant), so outbound TLS (e.g. to Vault) works.
-FROM alpine:3.22 AS certs
+FROM alpine:3.24 AS certs
 RUN apk add --no-cache ca-certificates
 
 # --- final image -----------------------------------------------------------
