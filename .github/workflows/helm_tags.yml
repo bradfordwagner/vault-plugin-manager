@@ -15,7 +15,7 @@ jobs:
 
       - uses: azure/setup-helm@v4
         with:
-          version: v3.16.2
+          version: v3.22.1
 
       # Chart version must be SemVer2, so strip a leading "v" from the tag.
       - name: version
