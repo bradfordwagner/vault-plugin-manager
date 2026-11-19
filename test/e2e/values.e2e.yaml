@@ -50,3 +50,4 @@ engineConfigs:
   enabled: true
   secretNames:
     - e2e-engine-creds
+    - e2e-optional-creds

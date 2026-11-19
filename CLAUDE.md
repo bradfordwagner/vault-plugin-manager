@@ -136,11 +136,17 @@ Unit tests need nothing; `test/e2e/` needs a container runtime + kind.
   incomplete record), because treating them as empty rewrites every entry, except
   with zero entries declared, where an unusable state Secret logs one Warn and
   skips the step so a deployment without engine configs keeps reconciling. Every
-  Secret is read once per pass, empty or non-UTF-8 values fail the pass, and every
-  mount UUID is checked before any write. A missing state Secret is created before
-  the first Vault write, so one that cannot be created fails the pass with nothing
-  written instead of rewriting Vault every pass. Writes checkpoint the state even
-  when a later entry fails, so one bad entry does not rewrite the rest every pass.
+  Secret is read once per pass and every mount UUID is checked before any write.
+  **Failures are per entry**: one bad entry never stops the others, roles, or
+  prune; the pass still returns the joined errors at the end. A Secret or key that
+  does not exist yet is *pending*, not an error (an optional credential): one Warn
+  and one `result="skipped"` count per change, nothing written, no failed pass,
+  `/readyz` unaffected. Empty or non-UTF-8 values, Secret read errors, a mount that
+  is not live, and Vault write errors are real errors. A missing state Secret is
+  created before the first Vault write, so one that cannot be created fails the
+  pass with nothing written instead of rewriting Vault every pass. Writes
+  checkpoint the state even when an entry fails, so one bad entry does not rewrite
+  the rest every pass; a pending or failed entry keeps its old record.
   Removal drops the record and never deletes or rewrites Vault, under any
   `pruneMode`.
   Errors are scrubbed of resolved Secret values and a failed Vault write carries

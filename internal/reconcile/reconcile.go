@@ -7,6 +7,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -71,6 +72,10 @@ type Reconciler struct {
 	fetcher fetch.Fetcher
 	cfg     Config
 	log     *zap.SugaredLogger
+
+	// pendingEngineConfigs is the pending reason last reported per entry, so a
+	// pending entry is logged and counted when it changes, not every resync.
+	pendingEngineConfigs map[string]string
 }
 
 // New builds a Reconciler.
@@ -184,18 +189,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, spec *config.Spec) error {
 	// 4. Write engine configs whose content or mount changed. After the reload,
 	//    so a plugin is configured on the binary it will run; before roles,
 	//    which commonly depend on the engine being configured.
-	if err := r.reconcileEngineConfigs(ctx, spec); err != nil {
-		return err
-	}
+	//    A failed entry does not stop the pass: its error is returned at the end.
+	ecErr := r.reconcileEngineConfigs(ctx, spec)
 
 	// 5. Reconcile secret-engine roles (upsert declared roles; prune undeclared
 	//    ones on managed mounts under PruneFull).
-	if err := r.reconcileRoles(ctx, spec); err != nil {
-		return err
-	}
+	roleErr := r.reconcileRoles(ctx, spec)
 
 	// 6. Prune what left the spec.
-	return r.prune(ctx, spec.Settings.PruneMode, pods, desiredMounts, desiredVersions)
+	pruneErr := r.prune(ctx, spec.Settings.PruneMode, pods, desiredMounts, desiredVersions)
+	return errors.Join(ecErr, roleErr, pruneErr)
 }
 
 // reconcileRoles upserts every declared role, then — only under PruneFull —
@@ -218,6 +221,7 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 	// Apply pass: upsert declared roles. desiredRoles maps normalized mount ->
 	// rolesPath -> set of desired role names, reused by the prune pass below.
 	desiredRoles := make(map[string]map[string]map[string]bool)
+	var upsertErrs []error
 	for _, role := range spec.Roles {
 		mount := strings.Trim(role.Mount, "/")
 		changed, err := r.vault.EnsureRole(ctx, vault.Role{
@@ -228,9 +232,10 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 		})
 		metrics.VaultActionIf(metrics.ActionRoleUpsert, changed, err)
 		if err != nil {
-			return fmt.Errorf("reconcile: role %s/%s/%s: %w", mount, role.RolesPath, role.Name, err)
-		}
-		if changed {
+			// Fail this role only. It stays desired below, so pruning cannot
+			// delete the role that just failed to write.
+			upsertErrs = append(upsertErrs, fmt.Errorf("reconcile: role %s/%s/%s: %w", mount, role.RolesPath, role.Name, err))
+		} else if changed {
 			r.log.With("mount", mount, "rolesPath", role.RolesPath, "role", role.Name).Info("wrote role")
 		}
 		if desiredRoles[mount] == nil {
@@ -244,11 +249,11 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 
 	// Role-prune pass: only when the ConfigMap is fully authoritative.
 	if spec.Settings.PruneMode != config.PruneFull {
-		return nil
+		return errors.Join(upsertErrs...)
 	}
 	managed, err := r.vault.ListManagedMounts(ctx)
 	if err != nil {
-		return fmt.Errorf("reconcile: listing managed mounts for role prune: %w", err)
+		return errors.Join(append(upsertErrs, fmt.Errorf("reconcile: listing managed mounts for role prune: %w", err))...)
 	}
 	for _, mm := range managed {
 		mount := strings.Trim(mm.Path, "/")
