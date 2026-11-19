@@ -64,6 +64,9 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 	records, rv, err := r.loadEngineConfigState(ctx)
 	if err != nil {
 		if len(spec.EngineConfigs) == 0 {
+			// Nothing pending can survive an empty spec; forget it so a re-added
+			// entry is reported again.
+			r.pendingEngineConfigs = nil
 			// Nothing is declared, so there is nothing to protect: an unreadable
 			// state Secret must not stop roles and pruning for a deployment that
 			// does not use engine configs.

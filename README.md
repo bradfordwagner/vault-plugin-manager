@@ -147,11 +147,18 @@ JSON-encodable: quote anything YAML would read as a timestamp.
   annotations, so nothing else should annotate it.
 - **It fails closed.** The pass fails, with nothing written, when the state Secret
   cannot be read (anything but not found), has no `engine-configs.json` key, holds
-  malformed or `null` JSON, or has a record without both fields. It also fails when
-  a referenced Secret or key is missing, or a value is empty or not valid UTF-8, or
-  a referenced mount is not a live secret mount. A field whose real value is the
-  empty string goes in `data`, not a Secret. With no `engineConfigs` entries, an
-  unusable state Secret only logs a warning and the step is skipped.
+  malformed or `null` JSON, or has a record without both fields. A field whose real
+  value is the empty string goes in `data`, not a Secret. With no `engineConfigs`
+  entries, an unusable state Secret only logs a warning and the step is skipped.
+- **Failures are per entry.** One bad entry never stops the others, roles or
+  pruning; the pass still returns the joined errors at the end. A value that is
+  empty or not valid UTF-8, a Secret read error, a mount that is not a live secret
+  mount, and a failed Vault write are errors.
+- **A Secret or key that does not exist yet is pending, not an error.** The entry is
+  skipped with one Warn and one `vpm_vault_actions_total{action="engine_config",
+  result="skipped"}` count per change (not per resync); nothing is written, the pass
+  succeeds and `/readyz` is unaffected. The entry is written on the first pass after
+  the Secret appears. A pending or failed entry keeps its old state record.
 - **The state Secret is created before the first write.** When it does not exist
   and an entry needs a write, the manager creates it (holding `{}`) before writing
   Vault, so a Secret it cannot create fails the pass with nothing written.

@@ -251,9 +251,11 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 	if spec.Settings.PruneMode != config.PruneFull {
 		return errors.Join(upsertErrs...)
 	}
+	// Every failure below still reports the upsert failures gathered above.
+	fail := func(err error) error { return errors.Join(append(upsertErrs, err)...) }
 	managed, err := r.vault.ListManagedMounts(ctx)
 	if err != nil {
-		return errors.Join(append(upsertErrs, fmt.Errorf("reconcile: listing managed mounts for role prune: %w", err))...)
+		return fail(fmt.Errorf("reconcile: listing managed mounts for role prune: %w", err))
 	}
 	for _, mm := range managed {
 		mount := strings.Trim(mm.Path, "/")
@@ -262,7 +264,7 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 		for rolesPath, desired := range desiredRoles[mount] {
 			existing, err := r.vault.ListRoles(ctx, mount, rolesPath)
 			if err != nil {
-				return fmt.Errorf("reconcile: listing roles at %s/%s: %w", mount, rolesPath, err)
+				return fail(fmt.Errorf("reconcile: listing roles at %s/%s: %w", mount, rolesPath, err))
 			}
 			for _, name := range existing {
 				if desired[name] {
@@ -271,13 +273,13 @@ func (r *Reconciler) reconcileRoles(ctx context.Context, spec *config.Spec) erro
 				err := r.vault.DeleteRole(ctx, mount, rolesPath, name)
 				metrics.VaultAction(metrics.ActionRoleDelete, err)
 				if err != nil {
-					return fmt.Errorf("reconcile: pruning role %s/%s/%s: %w", mount, rolesPath, name, err)
+					return fail(fmt.Errorf("reconcile: pruning role %s/%s/%s: %w", mount, rolesPath, name, err))
 				}
 				r.log.With("mount", mount, "rolesPath", rolesPath, "role", name).Info("pruned role")
 			}
 		}
 	}
-	return nil
+	return errors.Join(upsertErrs...)
 }
 
 // prune removes manager-owned mounts (and, per mode, their versions/binaries)

@@ -183,18 +183,20 @@ rewrite with the seeded value breaks them. Each pass therefore:
    without saving; roles and pruning still run. NotFound with no entries is a
    quiet no-op.
 2. Resolves every entry before writing any: GETs each distinct `secretRef` Secret
-   once per pass, and every entry resolves from that snapshot. A missing Secret or
-   key fails the pass here, with nothing written, like any other reconcile error:
-   catalog and mounts have already converged, roles and pruning wait. An empty or
-   non-UTF-8 Secret value fails the pass the same way as a missing key. This is a
+   once per pass, and every entry resolves from that snapshot. Failures are per
+   entry: one bad entry never stops the others, roles or pruning, and the pass
+   returns the joined errors at the end. A missing Secret or key is *pending*, not
+   an error: the entry is skipped with one Warn and one `result="skipped"` count
+   per change (not per resync), and keeps its old record. An empty or non-UTF-8
+   Secret value is an error for that entry only. This is a
    deliberate restriction: a plugin field whose legitimate value is the empty
    string cannot be sourced from a Secret, and goes in `data` instead. Values are
    written verbatim, with no trimming.
 3. Reads the live UUID of each referenced mount from `sys/mounts`. Vault assigns a
    new UUID whenever a mount is enabled, so a mount that was disabled and
    re-enabled (by vpm or anyone else) is recognizable even though its path is not.
-   Every referenced mount must be present with a non-empty UUID before any write,
-   so an empty UUID is never recorded.
+   An entry whose mount is absent or has an empty UUID fails alone, before any
+   write, so an empty UUID is never recorded.
 4. For each entry, computes `sha256` over the canonical JSON of
    `{vault path, body}`. When both the digest and the mount UUID equal the
    recorded ones the entry is skipped; otherwise vpm writes the body to

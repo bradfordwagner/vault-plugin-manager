@@ -520,6 +520,7 @@ assert_no_restarts "after engine config removal"
 # is written once its Secret appears.
 log "Checking a missing Secret skips only its engine config entry"
 kubectl -n "$NS" delete secret e2e-optional-creds --ignore-not-found
+failed_before="$(kubectl -n "$NS" logs "$MGR_POD" --tail=-1 | { grep -c 'reconcile failed' || true; })"
 skipped_before="$(metrics_value 'vpm_vault_actions_total{action="engine_config",result="skipped"')"
 ENGINE_CONFIG=pending
 configmap_yaml pruned | kubectl apply -f -
@@ -527,7 +528,7 @@ retry 90 "other entry applied despite the missing Secret" engine_field_is app_id
 engine_field_is prv_key KEY2 || { echo "first entry not written: prv_key is '$(read_engine_field prv_key)'"; exit 1; }
 vexec 'vault read e2e-http/pending' >/dev/null 2>&1 && { echo "pending entry was written without its Secret"; exit 1; }
 retry 60 "readiness stays 200" vexec "wget -qO- http://${MGR_IP}:8080/readyz"
-failed_logged="$(kubectl -n "$NS" logs "$MGR_POD" --tail=-1 | { grep -c 'reconcile failed' || true; })"
+failed_logged="$(( $(kubectl -n "$NS" logs "$MGR_POD" --tail=-1 | { grep -c 'reconcile failed' || true; }) - failed_before ))"
 [[ "$failed_logged" -eq 0 ]] || { echo "reconcile failed ${failed_logged}x on a missing optional Secret"; exit 1; }
 # Let a few resyncs pass: the warn and the counter fire once per change only.
 passes="$(metrics_value 'vpm_reconcile_total{result="success"')"
