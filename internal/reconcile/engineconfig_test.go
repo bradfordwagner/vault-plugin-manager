@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"vault-plugin-manager/internal/config"
+	"vault-plugin-manager/internal/metrics"
 	"vault-plugin-manager/internal/vault"
 )
 
@@ -214,42 +215,90 @@ func TestEngineConfigMovedPathRewrites(t *testing.T) {
 	}
 }
 
-func TestEngineConfigMissingSecretFailsBeforeAnyWrite(t *testing.T) {
+func skippedEngineConfigs(t *testing.T) float64 {
+	t.Helper()
+	families, err := metrics.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	return metrics.CounterValue(families, "vpm_vault_actions_total",
+		map[string]string{"action": metrics.ActionEngineConfig, "result": metrics.ResultSkipped})
+}
+
+func TestEngineConfigMissingSecretIsPendingNotFatal(t *testing.T) {
 	g := newECRig(map[string][]byte{"pem": []byte("KEY1")})
+	logs := g.observeLogs()
+	before := skippedEngineConfigs(t)
 	spec := ecSpec(t, config.PruneNever, `roles:
   - {mount: github, name: r}
 `+ecGithub+`  - mount: other
     secretRef: {name: missing, keys: {prv_key: pem}}
 `)
-	err := g.pass(spec)
-	if err == nil {
-		t.Fatal("expected an error for a missing Secret")
+	g.mustPass(t, spec)
+	if len(g.fv.configWrites) != 1 || g.fv.configWrites[0] != "github/config" {
+		t.Errorf("writes = %v, want only github/config", g.fv.configWrites)
 	}
-	if !strings.Contains(err.Error(), "vault/missing") {
-		t.Errorf("error %q does not name the Secret", err)
-	}
-	if len(g.fv.configWrites) != 0 {
-		t.Errorf("writes = %v, want none", g.fv.configWrites)
-	}
+	rolesRan := false
 	for _, c := range g.fv.calls {
-		if strings.HasPrefix(c, "role:") {
-			t.Errorf("roles ran after a failed engine config step: %v", g.fv.calls)
-			break
-		}
+		rolesRan = rolesRan || strings.HasPrefix(c, "role:")
+	}
+	if !rolesRan {
+		t.Errorf("roles did not run: %v", g.fv.calls)
+	}
+	if got := skippedEngineConfigs(t) - before; got != 1 {
+		t.Errorf("skipped delta = %v, want 1", got)
+	}
+	// Resyncing with the Secret still absent neither warns nor counts again.
+	g.mustPass(t, spec)
+	warns := logs.FilterLevelExact(zapcore.WarnLevel).FilterMessageSnippet("skipped").All()
+	if len(warns) != 1 || !strings.Contains(warns[0].Message, "vault/missing") {
+		t.Errorf("warn lines = %v, want one naming vault/missing", warns)
+	}
+	if got := skippedEngineConfigs(t) - before; got != 1 {
+		t.Errorf("skipped delta after resync = %v, want 1", got)
+	}
+	// The Secret appears: the entry is written on the next pass.
+	g.secrets.secrets["missing"] = map[string][]byte{"pem": []byte("KEY2")}
+	g.mustPass(t, spec)
+	if len(g.fv.configWrites) != 2 || g.fv.configWrites[1] != "other/config" {
+		t.Errorf("writes = %v, want other/config written once the Secret exists", g.fv.configWrites)
 	}
 }
 
-func TestEngineConfigMissingKeyFails(t *testing.T) {
+func TestEngineConfigMissingKeyIsPending(t *testing.T) {
 	g := newECRig(map[string][]byte{"other": []byte("x")})
-	err := g.pass(ecSpec(t, config.PruneNever, ecGithub))
-	if err == nil {
-		t.Fatal("expected an error for a missing key")
-	}
-	if !strings.Contains(err.Error(), "creds") || !strings.Contains(err.Error(), "pem") {
-		t.Errorf("error %q does not name the Secret and key", err)
-	}
+	logs := g.observeLogs()
+	g.mustPass(t, ecSpec(t, config.PruneNever, ecGithub))
 	if len(g.fv.configWrites) != 0 {
 		t.Errorf("writes = %v, want none", g.fv.configWrites)
+	}
+	warns := logs.FilterLevelExact(zapcore.WarnLevel).All()
+	if len(warns) != 1 || !strings.Contains(warns[0].Message, "creds") || !strings.Contains(warns[0].Message, "pem") {
+		t.Errorf("warn lines = %v, want one naming the Secret and key", warns)
+	}
+}
+
+func TestEngineConfigFailedWriteIsolatedPerEntry(t *testing.T) {
+	g := newECRig(map[string][]byte{"pem": []byte("KEY1")})
+	g.fv.writeErr = map[string]error{"github/config": errors.New("HTTP 403")}
+	err := g.pass(ecSpec(t, config.PruneNever, `roles:
+  - {mount: github, name: r}
+`+ecGithubAndOther))
+	if err == nil || !strings.Contains(err.Error(), "github/config") || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("err = %v, want the failed entry reported", err)
+	}
+	if len(g.fv.configWrites) != 1 || g.fv.configWrites[0] != "other/config" {
+		t.Errorf("writes = %v, want other/config written despite the failure", g.fv.configWrites)
+	}
+	rolesRan := false
+	for _, c := range g.fv.calls {
+		rolesRan = rolesRan || strings.HasPrefix(c, "role:")
+	}
+	if !rolesRan {
+		t.Errorf("roles did not run after a failed engine config: %v", g.fv.calls)
+	}
+	if rec := g.records(t); rec["other/config"].SHA256 == "" || rec["github/config"].SHA256 != "" {
+		t.Errorf("records = %v, want only other/config checkpointed", rec)
 	}
 }
 
@@ -497,7 +546,7 @@ func stateDoc(doc string) map[string][]byte {
 	return map[string][]byte{engineConfigStateKey: []byte(doc)}
 }
 
-func TestEngineConfigMountUUIDsValidatedBeforeAnyWrite(t *testing.T) {
+func TestEngineConfigMountUUIDsFailOnlyTheirEntry(t *testing.T) {
 	wantDetail := map[string]string{
 		"mount absent":     "is not a live secret mount",
 		"empty mount uuid": "reports an empty UUID",
@@ -509,9 +558,6 @@ func TestEngineConfigMountUUIDsValidatedBeforeAnyWrite(t *testing.T) {
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
 			g := newECRig(map[string][]byte{"pem": []byte("KEY1")})
-			// A stale record that a completed step would drop, so reaching the
-			// save would show up as a put.
-			g.secrets.secrets[testConfig().StateSecretName] = stateDoc(`{"gone/config":{"sha256":"ab","mountUUID":"u-g"}}`)
 			mutate(g.fv.uuids)
 			err := g.pass(ecSpec(t, config.PruneNever, ecGithubAndOther))
 			if err == nil {
@@ -520,11 +566,9 @@ func TestEngineConfigMountUUIDsValidatedBeforeAnyWrite(t *testing.T) {
 			if want := `mount "other" ` + wantDetail[name]; !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not contain %q", err, want)
 			}
-			if len(g.fv.configWrites) != 0 {
-				t.Errorf("writes = %v, want none", g.fv.configWrites)
-			}
-			if len(g.secrets.puts) != 0 {
-				t.Errorf("state saved %v, want no save", g.secrets.puts)
+			// Only the entry on the bad mount fails; the other still writes.
+			if len(g.fv.configWrites) != 1 || g.fv.configWrites[0] != "github/config" {
+				t.Errorf("writes = %v, want only github/config", g.fv.configWrites)
 			}
 		})
 	}

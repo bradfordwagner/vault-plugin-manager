@@ -169,6 +169,7 @@ func init() {
 			vaultActions.WithLabelValues(action, result)
 		}
 	}
+	vaultActions.WithLabelValues(ActionEngineConfig, ResultSkipped)
 }
 
 // Handler serves the registry in the Prometheus text format.
@@ -270,6 +271,13 @@ func VaultAction(action string, err error) {
 		result = ResultError
 	}
 	vaultActions.WithLabelValues(action, result).Inc()
+}
+
+// VaultActionSkipped records an entry left unwritten because an input it needs
+// does not exist yet (an engine config whose Secret is absent). Call it once per
+// change, not per pass, or a healthy deployment sits at a permanent rate.
+func VaultActionSkipped(action string) {
+	vaultActions.WithLabelValues(action, ResultSkipped).Inc()
 }
 
 // VaultActionIf records an Ensure*-style call that may have been a no-op: it

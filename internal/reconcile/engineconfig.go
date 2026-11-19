@@ -64,6 +64,9 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 	records, rv, err := r.loadEngineConfigState(ctx)
 	if err != nil {
 		if len(spec.EngineConfigs) == 0 {
+			// Nothing pending can survive an empty spec; forget it so a re-added
+			// entry is reported again.
+			r.pendingEngineConfigs = nil
 			// Nothing is declared, so there is nothing to protect: an unreadable
 			// state Secret must not stop roles and pruning for a deployment that
 			// does not use engine configs.
@@ -73,14 +76,10 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 		}
 		return err
 	}
-	entries, err := r.resolveEngineConfigs(ctx, spec.EngineConfigs, values)
-	if err != nil {
-		return err
-	}
-	uuids, err := r.engineConfigMountUUIDs(ctx, entries)
-	if err != nil {
-		return err
-	}
+	entries, pendingMsgs, errs := r.resolveEngineConfigs(ctx, spec.EngineConfigs, values)
+	r.reportPendingEngineConfigs(pendingMsgs)
+	entries, uuids, uuidErrs := r.engineConfigMountUUIDs(ctx, entries)
+	errs = append(errs, uuidErrs...)
 
 	type pendingWrite struct {
 		entry  resolvedEngineConfig
@@ -106,17 +105,16 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 	}
 
 	dirty := false
-	var writeErr error
 	for _, p := range pending {
 		e := p.entry
 		err := r.vault.WriteEngineConfig(ctx, e.key, e.body)
 		wrote := err == nil
 		metrics.VaultActionIf(metrics.ActionEngineConfig, wrote, err)
 		if err != nil {
-			// Stop here, but still checkpoint the writes that landed so they are
-			// not repeated on every pass while this entry keeps failing.
-			writeErr = fmt.Errorf("reconcile: engine config %s: %w", e.key, err)
-			break
+			// Fail this entry only; the others still write, and the checkpoint
+			// below keeps the ones that landed from repeating every pass.
+			errs = append(errs, fmt.Errorf("reconcile: engine config %s: %w", e.key, err))
+			continue
 		}
 		r.log.With("mount", e.mount, "path", e.path, "reason", p.reason).Info("wrote engine config")
 		records[e.key] = &engineConfigRecord{SHA256: e.digest, MountUUID: uuids[e.mount]}
@@ -124,9 +122,11 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 	}
 
 	// Drop records of entries that left the spec. Vault is left as it is.
-	declared := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		declared[e.key] = true
+	// Judged against the spec, not the resolved entries: a pending or failed
+	// entry is still declared, and its record must survive until it resolves.
+	declared := make(map[string]bool, len(spec.EngineConfigs))
+	for _, e := range spec.EngineConfigs {
+		declared[e.Mount+"/"+e.Path] = true
 	}
 	for key := range records {
 		if !declared[key] {
@@ -135,11 +135,26 @@ func (r *Reconciler) writeEngineConfigs(ctx context.Context, spec *config.Spec, 
 		}
 	}
 
-	var saveErr error
 	if dirty {
-		saveErr = r.saveEngineConfigState(ctx, rv, records)
+		if err := r.saveEngineConfigState(ctx, rv, records); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return errors.Join(writeErr, saveErr)
+	return errors.Join(errs...)
+}
+
+// reportPendingEngineConfigs logs each pending entry once per change and counts
+// it as skipped. A Secret that is absent on purpose is not an error, and a
+// per-pass Warn or counter would put a permanent rate on a healthy deployment.
+func (r *Reconciler) reportPendingEngineConfigs(pending map[string]string) {
+	for key, msg := range pending {
+		if r.pendingEngineConfigs[key] == msg {
+			continue
+		}
+		r.log.With("path", key).Warnf("engine config %s skipped: %s (pending)", key, msg)
+		metrics.VaultActionSkipped(metrics.ActionEngineConfig)
+	}
+	r.pendingEngineConfigs = pending
 }
 
 // writeReason is why an entry with this digest on the mount with this UUID
@@ -195,11 +210,17 @@ func (r *Reconciler) loadEngineConfigState(ctx context.Context) (map[string]*eng
 
 // resolveEngineConfigs builds and digests every body before anything is
 // written. Each referenced Secret is read once, so entries sharing a Secret
-// resolve from the same snapshot.
-func (r *Reconciler) resolveEngineConfigs(ctx context.Context, entries []config.EngineConfigEntry, values *[]string) ([]resolvedEngineConfig, error) {
+// resolve from the same snapshot. A failing entry is dropped from the result
+// alone: a Secret or key that does not exist yet is pending (keyed by entry,
+// with the reason), anything else is an error.
+func (r *Reconciler) resolveEngineConfigs(ctx context.Context, entries []config.EngineConfigEntry, values *[]string) ([]resolvedEngineConfig, map[string]string, []error) {
 	ns := r.cfg.SecretNamespace
 	snapshot := make(map[string]map[string][]byte)
+	missing := make(map[string]bool) // Secrets already found absent this pass
+	pending := make(map[string]string)
+	var errs []error
 	out := make([]resolvedEngineConfig, 0, len(entries))
+entries:
 	for _, e := range entries {
 		key := e.Mount + "/" + e.Path
 		body := make(map[string]any, len(e.Data))
@@ -207,13 +228,20 @@ func (r *Reconciler) resolveEngineConfigs(ctx context.Context, entries []config.
 
 		if ref := e.SecretRef; ref != nil {
 			data, ok := snapshot[ref.Name]
+			if missing[ref.Name] {
+				pending[key] = fmt.Sprintf("Secret %s/%s not found", ns, ref.Name)
+				continue
+			}
 			if !ok {
 				d, _, err := r.secrets.GetSecretData(ctx, ns, ref.Name)
 				if errors.Is(err, k8s.ErrNotFound) {
-					return nil, fmt.Errorf("reconcile: engine config %s: Secret %s/%s not found", key, ns, ref.Name)
+					missing[ref.Name] = true
+					pending[key] = fmt.Sprintf("Secret %s/%s not found", ns, ref.Name)
+					continue
 				}
 				if err != nil {
-					return nil, fmt.Errorf("reconcile: engine config %s: reading Secret %s/%s: %w", key, ns, ref.Name, err)
+					errs = append(errs, fmt.Errorf("reconcile: engine config %s: reading Secret %s/%s: %w", key, ns, ref.Name, err))
+					continue
 				}
 				snapshot[ref.Name] = d
 				data = d
@@ -223,11 +251,14 @@ func (r *Reconciler) resolveEngineConfigs(ctx context.Context, entries []config.
 				v, ok := data[secretKey]
 				switch {
 				case !ok:
-					return nil, fmt.Errorf("reconcile: engine config %s: Secret %s/%s has no key %q", key, ns, ref.Name, secretKey)
+					pending[key] = fmt.Sprintf("Secret %s/%s has no key %q", ns, ref.Name, secretKey)
+					continue entries
 				case len(v) == 0:
-					return nil, fmt.Errorf("reconcile: engine config %s: Secret %s/%s key %q is empty", key, ns, ref.Name, secretKey)
+					errs = append(errs, fmt.Errorf("reconcile: engine config %s: Secret %s/%s key %q is empty", key, ns, ref.Name, secretKey))
+					continue entries
 				case !utf8.Valid(v):
-					return nil, fmt.Errorf("reconcile: engine config %s: Secret %s/%s key %q is not valid UTF-8", key, ns, ref.Name, secretKey)
+					errs = append(errs, fmt.Errorf("reconcile: engine config %s: Secret %s/%s key %q is not valid UTF-8", key, ns, ref.Name, secretKey))
+					continue entries
 				}
 				s := string(v)
 				body[field] = s
@@ -237,32 +268,37 @@ func (r *Reconciler) resolveEngineConfigs(ctx context.Context, entries []config.
 
 		digest, err := engineConfigDigest(key, body)
 		if err != nil {
-			return nil, fmt.Errorf("reconcile: engine config %s: encoding body: %w", key, err)
+			errs = append(errs, fmt.Errorf("reconcile: engine config %s: encoding body: %w", key, err))
+			continue
 		}
 		out = append(out, resolvedEngineConfig{mount: e.Mount, path: e.Path, key: key, body: body, digest: digest})
 	}
-	return out, nil
+	return out, pending, errs
 }
 
-// engineConfigMountUUIDs reads the live mount UUIDs and checks every entry's
-// mount has one before any write, so an empty UUID is never recorded.
-func (r *Reconciler) engineConfigMountUUIDs(ctx context.Context, entries []resolvedEngineConfig) (map[string]string, error) {
+// engineConfigMountUUIDs reads the live mount UUIDs and drops every entry whose
+// mount has none, so an empty UUID is never recorded. Those entries fail alone.
+func (r *Reconciler) engineConfigMountUUIDs(ctx context.Context, entries []resolvedEngineConfig) ([]resolvedEngineConfig, map[string]string, []error) {
 	if len(entries) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	uuids, err := r.vault.SecretMountUUIDs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("reconcile: engine configs: %w", err)
+		return nil, nil, []error{fmt.Errorf("reconcile: engine configs: %w", err)}
 	}
+	var errs []error
+	ok := entries[:0:0]
 	for _, e := range entries {
-		switch uuid, ok := uuids[e.mount]; {
-		case !ok:
-			return nil, fmt.Errorf("reconcile: engine config %s: mount %q is not a live secret mount", e.key, e.mount)
+		switch uuid, found := uuids[e.mount]; {
+		case !found:
+			errs = append(errs, fmt.Errorf("reconcile: engine config %s: mount %q is not a live secret mount", e.key, e.mount))
 		case uuid == "":
-			return nil, fmt.Errorf("reconcile: engine config %s: mount %q reports an empty UUID", e.key, e.mount)
+			errs = append(errs, fmt.Errorf("reconcile: engine config %s: mount %q reports an empty UUID", e.key, e.mount))
+		default:
+			ok = append(ok, e)
 		}
 	}
-	return uuids, nil
+	return ok, uuids, errs
 }
 
 // saveEngineConfigState writes records back as an update guarded by rv. The
